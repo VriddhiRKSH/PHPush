@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.2.0"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$REPO_ROOT" ] || { echo "error: run phpush from inside the git project you want to deploy" >&2; exit 1; }
+SECRET_FILE="$REPO_ROOT/.deploy_secret"
+
+DRY_RUN=0
+NO_DELETE=0
+REHASH=0
+CHUNK_BYTES="${DEPLOY_CHUNK_BYTES:-1048576}"
+
+usage() {
+    cat <<'EOF'
+phpush — mirror the current git project's working tree to a PHPush receiver over HTTPS.
+
+Usage:
+  cd /path/to/your-project
+  phpush [--dry-run] [--no-delete] [--rehash]
+
+Options:
+  -n, --dry-run    Show what would be uploaded/deleted, change nothing.
+      --no-delete  Upload changes but never delete server files.
+      --rehash     Ask the server to re-hash from disk (ignore its manifest cache).
+  -h, --help       Show this help.
+  -V, --version    Print version.
+
+Config is read from .deploy_secret at the project root (gitignored), or env vars:
+  DEPLOY_URL="https://your-site.example/path/phpush.php"
+  DEPLOY_TOKEN="<the same token set in phpush.php on the server>"
+
+The secret file is PARSED, not executed. The token travels in a header over HTTPS
+and is passed to curl via a private config file (never on the command line).
+
+Only files tracked or untracked-but-not-ignored by git are deployed. Files removed
+locally are removed from the server (unless --no-delete) so it mirrors your tree.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        --no-delete) NO_DELETE=1 ;;
+        --rehash) REHASH=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -V|--version) echo "phpush $VERSION"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+for tool in git curl base64; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "error: '$tool' is required but not installed" >&2; exit 1; }
+done
+
+if command -v shasum >/dev/null 2>&1; then
+    sha1_of() { shasum -a 1 "$1" | awk '{print $1}'; }
+elif command -v sha1sum >/dev/null 2>&1; then
+    sha1_of() { sha1sum "$1" | awk '{print $1}'; }
+else
+    echo "error: need 'shasum' or 'sha1sum'" >&2; exit 1
+fi
+
+if command -v gstat >/dev/null 2>&1; then
+    size_of() { gstat -c %s "$1"; }
+elif stat -f %z . >/dev/null 2>&1; then
+    size_of() { stat -f %z "$1"; }
+else
+    size_of() { stat -c %s "$1"; }
+fi
+
+load_secret() {
+    local f="$1" line key val
+    if [ -L "$f" ]; then
+        echo "error: $f is a symlink; refusing to read the secret through it" >&2
+        exit 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#export }"
+        case "$line" in
+            DEPLOY_URL=*) key=DEPLOY_URL; val="${line#DEPLOY_URL=}" ;;
+            DEPLOY_TOKEN=*) key=DEPLOY_TOKEN; val="${line#DEPLOY_TOKEN=}" ;;
+            *) continue ;;
+        esac
+        case "$val" in
+            \"*\") val="${val#\"}"; val="${val%\"}" ;;
+            \'*\') val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        if [ "$key" = DEPLOY_URL ] && [ -z "${DEPLOY_URL:-}" ]; then DEPLOY_URL="$val"; fi
+        if [ "$key" = DEPLOY_TOKEN ] && [ -z "${DEPLOY_TOKEN:-}" ]; then DEPLOY_TOKEN="$val"; fi
+    done < "$f"
+}
+
+if [ -z "${DEPLOY_URL:-}" ] || [ -z "${DEPLOY_TOKEN:-}" ]; then
+    [ -f "$SECRET_FILE" ] || { echo "error: missing $SECRET_FILE — create it with DEPLOY_URL and DEPLOY_TOKEN (see PHPush/.deploy_secret.example)" >&2; exit 1; }
+    load_secret "$SECRET_FILE"
+fi
+: "${DEPLOY_URL:?DEPLOY_URL not set (env or .deploy_secret)}"
+: "${DEPLOY_TOKEN:?DEPLOY_TOKEN not set (env or .deploy_secret)}"
+
+case "$DEPLOY_URL" in
+    https://*) ;;
+    http://127.0.0.1*|http://localhost*|'http://[::1]'*)
+        echo "warning: DEPLOY_URL uses insecure http to localhost (testing only)" >&2 ;;
+    http://*)
+        echo "error: DEPLOY_URL must use https:// — refusing to send the token over cleartext http" >&2; exit 1 ;;
+    *)
+        echo "error: DEPLOY_URL must start with https:// (got: $DEPLOY_URL)" >&2; exit 1 ;;
+esac
+
+cd "$REPO_ROOT" || { echo "error: cannot cd into $REPO_ROOT" >&2; exit 1; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: not a git repository" >&2; exit 1; }
+
+b64url() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+TMPDIR_WORK="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+LOCAL_LIST="$TMPDIR_WORK/local"
+SERVER_LIST="$TMPDIR_WORK/server"
+CURLRC="$TMPDIR_WORK/curlrc"
+
+( umask 077; : > "$CURLRC" )
+esc_token="${DEPLOY_TOKEN//\\/\\\\}"
+esc_token="${esc_token//\"/\\\"}"
+{
+    printf 'header = "X-Deploy-Token: %s"\n' "$esc_token"
+    case "$DEPLOY_URL" in https://*) printf 'proto = "=https"\n' ;; esac
+} >> "$CURLRC"
+unset esc_token
+
+NL=$'\n'; TAB=$'\t'; CR=$'\r'
+
+: > "$LOCAL_LIST"
+local_count=0
+bad_names=0
+while IFS= read -r -d '' rel; do
+    case "$rel" in
+        .deploy_secret|.deploy_secret.example) continue ;;
+    esac
+    case "$rel" in
+        *"$NL"*|*"$TAB"*|*"$CR"*)
+            echo "error: path contains a newline/tab/carriage-return and cannot be deployed: $(printf '%q' "$rel")" >&2
+            bad_names=1
+            continue ;;
+    esac
+    [ -f "./$rel" ] || continue
+    h="$(sha1_of "./$rel")"
+    [ -n "$h" ] || { echo "error: failed to hash $rel" >&2; exit 1; }
+    printf '%s\t%s\n' "$rel" "$h" >> "$LOCAL_LIST"
+    local_count=$((local_count + 1))
+done < <(git ls-files --cached --others --exclude-standard -z)
+
+if [ "$bad_names" -ne 0 ]; then
+    echo "error: rename the path(s) above (control characters break the deploy protocol) and re-run" >&2
+    exit 1
+fi
+
+if [ "$local_count" -eq 0 ]; then
+    echo "error: no deployable files found — refusing to mirror an empty tree" >&2
+    exit 1
+fi
+
+MANIFEST_URL="$DEPLOY_URL?action=manifest"
+[ "$REHASH" -eq 1 ] && MANIFEST_URL="$MANIFEST_URL&fresh=1"
+
+http_code="$(curl -sS -K "$CURLRC" --connect-timeout 15 --max-time 120 -o "$SERVER_LIST" -w '%{http_code}' \
+    "$MANIFEST_URL")" || { echo "error: could not reach $DEPLOY_URL" >&2; exit 1; }
+
+if [ "$http_code" != "200" ]; then
+    echo "error: manifest request failed (HTTP $http_code):" >&2
+    cat "$SERVER_LIST" >&2
+    exit 1
+fi
+
+LOCAL_PH="$TMPDIR_WORK/local_ph"
+SERVER_PH="$TMPDIR_WORK/server_ph"
+LC_ALL=C sort "$LOCAL_LIST" > "$LOCAL_PH"
+
+: > "$SERVER_PH"
+while IFS=$'\t' read -r hash rel || [ -n "$hash" ]; do
+    [ -n "${rel:-}" ] || continue
+    printf '%s\t%s\n' "$rel" "$hash" >> "$SERVER_PH"
+done < "$SERVER_LIST"
+LC_ALL=C sort -o "$SERVER_PH" "$SERVER_PH"
+
+server_count=$(wc -l < "$SERVER_PH" | tr -d ' ')
+
+UPLOADS=()
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    UPLOADS+=("${line%%$'\t'*}")
+done < <(LC_ALL=C comm -23 "$LOCAL_PH" "$SERVER_PH")
+
+DELETES=()
+while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    DELETES+=("$rel")
+done < <(LC_ALL=C comm -23 <(cut -f1 "$SERVER_PH" | LC_ALL=C sort -u) <(cut -f1 "$LOCAL_PH" | LC_ALL=C sort -u))
+
+[ "$NO_DELETE" -eq 1 ] && DELETES=()
+
+echo "Target : $DEPLOY_URL"
+echo "Local  : $local_count files   Server: $server_count files"
+echo "Upload : ${#UPLOADS[@]}   Delete: ${#DELETES[@]}"
+echo
+
+if [ "${#UPLOADS[@]}" -gt 0 ]; then
+    echo "— to upload —"
+    printf '  + %s\n' "${UPLOADS[@]}"
+fi
+if [ "${#DELETES[@]}" -gt 0 ]; then
+    echo "— to delete —"
+    printf '  - %s\n' "${DELETES[@]}"
+fi
+
+if [ "${#UPLOADS[@]}" -eq 0 ] && [ "${#DELETES[@]}" -eq 0 ]; then
+    echo "Already in sync. Nothing to do."
+    exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo
+    echo "(dry run — nothing sent)"
+    exit 0
+fi
+
+echo
+
+extract_sha1() { printf '%s' "$1" | sed -n 's/.*"sha1":"\([0-9a-f]*\)".*/\1/p'; }
+
+push_chunk() {
+    curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 600 \
+        -H "X-Deploy-Path: $1" \
+        -H "X-Deploy-Mode: $2" \
+        -H "X-Deploy-Final: $3" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$4" \
+        "$DEPLOY_URL?action=push"
+}
+
+upload_file() {
+    local rel="$1" size b64 want resp chunkno offset mode final
+    size="$(size_of "./$rel")"
+    b64="$(b64url "$rel")"
+    want="$(sha1_of "./$rel")"
+    case "$size" in ''|*[!0-9]*) echo "  ! cannot size: $rel" >&2; return 1 ;; esac
+    [ -n "$want" ] || { echo "  ! cannot hash: $rel" >&2; return 1; }
+    if [ "$size" -le "$CHUNK_BYTES" ]; then
+        resp="$(push_chunk "$b64" w 1 "./$rel")" || return 1
+    else
+        chunkno=0
+        while :; do
+            [ "$chunkno" -eq 0 ] && mode=w || mode=a
+            dd if="./$rel" of="$TMPDIR_WORK/chunk" bs="$CHUNK_BYTES" skip="$chunkno" count=1 2>/dev/null
+            offset=$(( (chunkno + 1) * CHUNK_BYTES ))
+            [ "$offset" -ge "$size" ] && final=1 || final=0
+            resp="$(push_chunk "$b64" "$mode" "$final" "$TMPDIR_WORK/chunk")" || return 1
+            chunkno=$((chunkno + 1))
+            [ "$final" -eq 1 ] && break
+        done
+    fi
+    [ "$(extract_sha1 "$resp")" = "$want" ] || { echo "  ! verify failed: $rel" >&2; return 1; }
+    return 0
+}
+
+upload_failures=0
+total="${#UPLOADS[@]}"
+if [ "$total" -gt 0 ]; then
+    n=0
+    for rel in "${UPLOADS[@]}"; do
+        n=$((n + 1))
+        printf '\r  uploading %d/%d ' "$n" "$total"
+        upload_file "$rel" || { upload_failures=$((upload_failures + 1)); echo "  FAILED: $rel" >&2; }
+    done
+    printf '\r  uploaded %d/%d file(s)        \n' "$((total - upload_failures))" "$total"
+fi
+
+if [ "$upload_failures" -gt 0 ]; then
+    echo "WARNING: $upload_failures file(s) failed to upload — server is NOT in sync and deletes were SKIPPED. Re-run to retry." >&2
+    exit 1
+fi
+
+if [ "${#DELETES[@]}" -gt 0 ]; then
+    json="["
+    first=1
+    for rel in "${DELETES[@]}"; do
+        [ "$first" -eq 1 ] || json="$json,"
+        json="$json\"$(json_escape "$rel")\""
+        first=0
+    done
+    json="$json]"
+    echo "  deleting ${#DELETES[@]} file(s)..."
+    curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 120 \
+        -H "Content-Type: application/json" \
+        --data-binary "$json" \
+        "$DEPLOY_URL?action=delete" >/dev/null || { echo "error: delete request failed" >&2; exit 1; }
+fi
+
+echo "Done. The server now mirrors your working tree."
