@@ -20,10 +20,13 @@ jobs:
         run: php -l phpush.php
 
       - name: ShellCheck client + tests
-        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh
+        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh tests/modes.sh
 
       - name: Integration tests (working-tree mode)
         run: bash tests/run.sh
 
       - name: Integration tests (--git mode)
         run: bash tests/git.sh
+
+      - name: Integration tests (mode interactions)
+        run: bash tests/modes.sh

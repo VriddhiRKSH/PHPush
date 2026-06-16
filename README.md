@@ -95,32 +95,62 @@ Done. The server now matches commit 79885368da.
   (Copy `.deploy_secret.example` as a starting point. The file is **parsed, not
   executed** — only `DEPLOY_URL` and `DEPLOY_TOKEN` are read.)
 
+## Install (make `phpush` a global command)
+
+`phpush` is a plain bash script — **nothing to build or compile.** To run it as a
+bare `phpush` from any project, symlink it onto your `PATH` (from inside the PHPush
+repo):
+
+```sh
+ln -s "$(pwd)/phpush" /usr/local/bin/phpush
+# Apple-Silicon Homebrew users may prefer:  ln -s "$(pwd)/phpush" /opt/homebrew/bin/phpush
+```
+
+Because it's a **symlink**, you never reinstall: a `git pull` or any local edit to
+the script is picked up automatically the next time you run `phpush`. (If you
+*copy* the file instead of symlinking, re-copy it after each update.) To remove it
+later: `rm /usr/local/bin/phpush`.
+
 ## Use
 
 ```sh
 cd /path/to/your-project
-/path/to/PHPush/phpush --dry-run   # preview what would upload/delete
-/path/to/PHPush/phpush             # mirror the working tree to the server
+phpush --dry-run   # preview what would upload/delete (changes nothing)
+phpush             # deploy: mirror your working tree to the server
 ```
 
-Tip: symlink it onto your `PATH` — `ln -s /path/to/PHPush/phpush /usr/local/bin/phpush` —
-then just run `phpush` from any project.
+### Two modes — working tree vs. committed
 
-### Two modes
+| | `phpush` (default) | `phpush --git` |
+|---|---|---|
+| **Deploys** | your folder **right now** (committed + uncommitted + untracked, minus gitignored) | your **last commit** only (uncommitted & untracked ignored) |
+| **Sends** | files whose content differs from the server | files changed in commits since the last `--git` deploy |
+| **Best for** | fast iteration | clean, reproducible releases |
+| **Tracks a commit?** | no | yes — the server remembers the last deployed commit |
 
-- **Working-tree (default):** deploys what's in your folder right now — including
-  uncommitted edits and new untracked files (anything not gitignored). Good for
-  iterating fast.
-- **Committed (`--git`):** deploys your **last commit** and ignores uncommitted
-  changes. The server remembers the last commit it received, so each run sends
-  only the files changed in the commits since then (a full resync happens
-  automatically on the first run or if history was rewritten). Good for clean,
-  reproducible releases.
+```sh
+phpush                  # deploy whatever is in my folder now
+phpush --git            # deploy my last commit; only changed-since-last files go up
+phpush --git --dry-run  # preview either mode
+```
 
-  ```sh
-  phpush --git            # deploy HEAD; only changed-since-last-deploy files go up
-  phpush --git --dry-run  # preview
-  ```
+The first `--git` run (or one after a rewritten history, or with `--rehash`) does a
+**full resync** — it deploys the whole committed snapshot and mirrors it. After
+that, each run is **incremental**.
+
+**Mixing the two modes? Know this:** default mode pushes uncommitted edits live and
+never moves the commit marker. If you then run `phpush --git`, its incremental mode
+only re-sends files that have a **new commit** — so an uncommitted change you pushed
+with default mode, for a file that wasn't later committed, will **stay** on the
+server. To force the server back to an exact copy of your last commit (cleaning up
+any such drift and removing non-committed files):
+
+```sh
+phpush --git --rehash
+```
+
+Simplest habit: **pick one mode per project** — default for iterating, `--git` for
+releases. These exact interactions are pinned down in `tests/modes.sh`.
 
 ### Options
 
@@ -165,10 +195,11 @@ Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 ## Tests
 
 ```sh
-tests/run.sh   # working-tree mode: security guards + full mirror
-tests/git.sh   # --git mode: cursor, incremental, add/delete/rename, resync
+tests/run.sh     # working-tree mode: security guards + full mirror
+tests/git.sh     # --git mode: cursor, incremental, add/delete/rename, resync
+tests/modes.sh   # mixing the two modes: uncommitted vs committed, drift, --rehash reset
 ```
-Both spin up `php -S` locally and need no network. CI runs them on every push.
+Each spins up `php -S` locally and needs no network. CI runs all three on every push.
 
 ## Changelog & security
 
