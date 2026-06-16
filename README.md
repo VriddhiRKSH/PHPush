@@ -1,16 +1,63 @@
 # PHPush
 
+[![CI](https://github.com/VriddhiRKSH/PHPush/actions/workflows/ci.yml/badge.svg)](https://github.com/VriddhiRKSH/PHPush/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Git-style deploys for hosts that don't even give you FTP.**
 
-PHPush pushes your local git working tree to a web host over plain HTTPS — no
+PHPush pushes your local git project to a web host over plain HTTPS — no
 FTP, no SSH, no shell on the server. You upload **one** small, token-protected
 PHP file through whatever the host gives you (a cPanel/Plesk File Manager is
 enough), and from then on a single local command mirrors your project up to it:
 content-hash diff, only changed files, chunked uploads, atomic writes, and
-deletion of files you removed — so the server always matches your working tree.
+deletion of files you removed — so the server always matches your project.
 
 It needs nothing on the host but the ability to serve PHP. No git, no shell, no
 `exec`, no FTP, no SFTP.
+
+## Demo
+
+```console
+$ phpush --dry-run
+Target : https://your-site.example/path/phpush.php
+Upload : 4   Delete: 0
+
+— to upload —
+  + css/site.css
+  + index.html
+  + js/app.js
+  + robots.txt
+
+(dry run — nothing sent)
+
+$ phpush
+Target : https://your-site.example/path/phpush.php
+Upload : 4   Delete: 0
+...
+  uploaded 4/4 file(s)
+Done. The server now mirrors your working tree.
+
+$ phpush                       # nothing changed → cheap content-hash diff
+Already in sync. Nothing to do.
+```
+
+Deploy a clean release straight from your last commit instead (ignores
+uncommitted edits; sends only what changed since the previous deploy):
+
+```console
+$ phpush --git
+Target : https://your-site.example/path/phpush.php
+Mode   : git (incremental) — commit 79885368da
+Since  : b21c334f18
+Upload : 2   Delete: 0
+
+— to upload —
+  + app.js
+  + css/site.css
+
+  uploaded 2/2 file(s)
+Done. The server now matches commit 79885368da.
+```
 
 ## Pieces
 
@@ -122,6 +169,11 @@ tests/run.sh   # working-tree mode: security guards + full mirror
 tests/git.sh   # --git mode: cursor, incremental, add/delete/rename, resync
 ```
 Both spin up `php -S` locally and need no network. CI runs them on every push.
+
+## Changelog & security
+
+Release notes live in [CHANGELOG.md](CHANGELOG.md). The threat model and how to
+report a vulnerability are in [SECURITY.md](SECURITY.md).
 
 ## License
 
