@@ -5,6 +5,7 @@ const ALLOW_IPS = [];
 const MAX_PUSH_BYTES = 0;
 
 const CACHE_FILE = '.phpush-cache.json';
+const COMMIT_FILE = '.phpush-commit';
 const TMP_SUFFIX = '.phpush-tmp';
 
 $root = rtrim(str_replace('\\', '/', __DIR__), '/');
@@ -12,7 +13,7 @@ $realRoot = realpath($root);
 $realRoot = $realRoot === false ? $root : str_replace('\\', '/', $realRoot);
 
 $self = basename(__FILE__);
-$protectedLower = array_map('strtolower', [$self, CACHE_FILE]);
+$protectedLower = array_map('strtolower', [$self, CACHE_FILE, COMMIT_FILE]);
 
 $selfReal = realpath(__FILE__);
 $selfReal = $selfReal === false ? '' : strtolower(str_replace('\\', '/', $selfReal));
@@ -272,6 +273,25 @@ if ($action === 'delete') {
         }
     }
     respond(empty($errors) ? 200 : 207, ['ok' => empty($errors), 'deleted' => $deleted, 'errors' => $errors]);
+}
+
+if ($action === 'commit') {
+    $commitPath = $root . '/' . COMMIT_FILE;
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+        $body = trim((string) file_get_contents('php://input'));
+        if ($body !== '' && !preg_match('/^[0-9a-f]{40,64}$/', $body)) {
+            respond(400, ['ok' => false, 'error' => 'bad commit id']);
+        }
+        $tmp = $commitPath . TMP_SUFFIX;
+        if (@file_put_contents($tmp, $body) === false || !@rename($tmp, $commitPath)) {
+            @unlink($tmp);
+            respond(500, ['ok' => false, 'error' => 'write failed']);
+        }
+        @chmod($commitPath, 0600);
+        respond(200, ['ok' => true, 'commit' => $body]);
+    }
+    $current = is_file($commitPath) ? trim((string) @file_get_contents($commitPath)) : '';
+    respond(200, ['ok' => true, 'commit' => $current]);
 }
 
 respond(400, ['ok' => false, 'error' => 'unknown action']);

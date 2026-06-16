@@ -59,13 +59,30 @@ cd /path/to/your-project
 Tip: symlink it onto your `PATH` — `ln -s /path/to/PHPush/phpush /usr/local/bin/phpush` —
 then just run `phpush` from any project.
 
+### Two modes
+
+- **Working-tree (default):** deploys what's in your folder right now — including
+  uncommitted edits and new untracked files (anything not gitignored). Good for
+  iterating fast.
+- **Committed (`--git`):** deploys your **last commit** and ignores uncommitted
+  changes. The server remembers the last commit it received, so each run sends
+  only the files changed in the commits since then (a full resync happens
+  automatically on the first run or if history was rewritten). Good for clean,
+  reproducible releases.
+
+  ```sh
+  phpush --git            # deploy HEAD; only changed-since-last-deploy files go up
+  phpush --git --dry-run  # preview
+  ```
+
 ### Options
 
 | Flag | Effect |
 |---|---|
+| `--git` | Deploy the last commit instead of the working tree (aliases: `--commit`, `--committed`). |
 | `-n`, `--dry-run` | Show what would upload/delete; change nothing. |
 | `--no-delete` | Upload changes but never delete server files. |
-| `--rehash` | Ask the server to re-hash from disk, ignoring its manifest cache. |
+| `--rehash` | Working-tree: ignore the server's hash cache. `--git`: force a full resync. |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
 You can also override `DEPLOY_CHUNK_BYTES` (default `1048576`, i.e. 1 MB) if your
@@ -101,8 +118,10 @@ Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 ## Tests
 
 ```sh
-tests/run.sh   # spins up `php -S`, asserts the security guards and a full mirror
+tests/run.sh   # working-tree mode: security guards + full mirror
+tests/git.sh   # --git mode: cursor, incremental, add/delete/rename, resync
 ```
+Both spin up `php -S` locally and need no network. CI runs them on every push.
 
 ## License
 
