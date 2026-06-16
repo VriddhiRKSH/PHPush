@@ -31,7 +31,7 @@ printf 'DEPLOY_URL="%s"\nDEPLOY_TOKEN="%s"\n' "$BASE" "$TOKEN" > .deploy_secret
 run() { "$CLIENT" "$@" 2>&1 | tr '\r' '\n' | grep -vE '^  uploading' || true; }
 sv()  { cat "$ROOT/$1" 2>/dev/null || true; }
 has() { [ -e "$ROOT/$1" ] && echo PRESENT || echo ABSENT; }
-cur() { cat "$ROOT/.phpush-commit" 2>/dev/null || echo NONE; }
+cur() { curl -s -H "X-Deploy-Token: $TOKEN" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p'; }
 
 echo "== default deploys uncommitted edits; --git ignores them =="
 printf 'A1\n' > a.txt; git add a.txt; git commit -qm c1; H1="$(git rev-parse HEAD)"

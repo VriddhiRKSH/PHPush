@@ -184,6 +184,10 @@ Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 
 - Only git-tracked (and untracked-but-not-ignored) files are deployed; ignored
   files and `.deploy_secret` never leave your machine.
+- **Your `.gitignore` is your secrets safety net.** Anything not gitignored gets
+  published to the public web root — so gitignore secrets like `.env` and DB
+  dumps, and run `--dry-run` before the first deploy to a real site. PHPush also
+  skips symlinks and refuses a `.deploy_secret` you've accidentally committed.
 - **Deploys mirror.** Files you removed locally are removed on the server (use
   `--no-delete` to keep them). The server ends up matching your working tree
   exactly — review `--dry-run` before the first run on an existing site.
@@ -195,11 +199,12 @@ Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 ## Tests
 
 ```sh
-tests/run.sh     # working-tree mode: security guards + full mirror
-tests/git.sh     # --git mode: cursor, incremental, add/delete/rename, resync
-tests/modes.sh   # mixing the two modes: uncommitted vs committed, drift, --rehash reset
+tests/run.sh        # working-tree mode: security guards + full mirror
+tests/git.sh        # --git mode: cursor, incremental, add/delete/rename, resync
+tests/modes.sh      # mixing the two modes: uncommitted vs committed, drift, --rehash
+tests/security.sh   # hardening regressions: metadata privacy, path guards, no-wipe, exfil
 ```
-Each spins up `php -S` locally and needs no network. CI runs all three on every push.
+Each spins up `php -S` locally and needs no network. CI runs all four on every push.
 
 ## Changelog & security
 

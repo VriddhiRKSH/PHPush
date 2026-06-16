@@ -4,6 +4,33 @@ All notable changes to PHPush are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-06-17
+
+A security-hardening release acting on an external review. Each fix has a
+regression test in `tests/security.sh`.
+
+### Security
+- **Metadata privacy (the one unauthenticated leak):** the receiver's cache and
+  commit-cursor files are now stored as self-guarding PHP files
+  (`.phpush-cache.php`, `.phpush-commit.php`) that emit nothing if fetched
+  directly — so a normal web server can no longer hand the site's file inventory,
+  hashes, or deployed commit to a tokenless visitor.
+- **`--git` no longer wipes the server** on a commit that resolves to zero
+  deployable files — it refuses, matching working-tree mode's empty-tree guard.
+- **Untrusted-repo hardening (client):** refuses a committed `.deploy_secret`,
+  **skips symlinks** instead of following them (no `~/.ssh/id_rsa` exfiltration),
+  rejects a newline-bearing token (curl-config injection), and skips a nested
+  `.deploy_secret` at any depth.
+- **Receiver path guards:** rejects control characters and `:` / NTFS `::$DATA`
+  stream syntax; `MAX_PUSH_BYTES` is now enforced cumulatively across chunked
+  appends; commit file gets full `realpath` self-protection; `X-Content-Type-Options:
+  nosniff` on all responses.
+- **CI** now runs with least-privilege `permissions: contents: read`.
+
+### Docs
+- SECURITY.md documents shared-host token reads, the `ALLOW_IPS`-behind-proxy
+  caveat, token-entropy guidance, and "your .gitignore is the secrets safety net."
+
 ## [0.3.0] — 2026-06-16
 
 ### Added
@@ -51,6 +78,7 @@ push-to-deploy mirror: token-gated PHP receiver plus a bash client that diffs by
 content hash, uploads only changed files in chunks, verifies by sha1, and mirrors
 deletions.
 
+[0.4.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.0
 [0.3.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.3.0
 [0.2.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.2.0
 [0.1.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.1.0

@@ -4,9 +4,10 @@ const DEPLOY_TOKEN = '__PASTE_64_HEX_TOKEN_HERE__';
 const ALLOW_IPS = [];
 const MAX_PUSH_BYTES = 0;
 
-const CACHE_FILE = '.phpush-cache.json';
-const COMMIT_FILE = '.phpush-commit';
+const CACHE_FILE = '.phpush-cache.php';
+const COMMIT_FILE = '.phpush-commit.php';
 const TMP_SUFFIX = '.phpush-tmp';
+const STATE_GUARD = "<?php http_response_code(404); exit; ?>\n";
 
 $root = rtrim(str_replace('\\', '/', __DIR__), '/');
 $realRoot = realpath($root);
@@ -19,6 +20,8 @@ $selfReal = realpath(__FILE__);
 $selfReal = $selfReal === false ? '' : strtolower(str_replace('\\', '/', $selfReal));
 $cacheReal = realpath($root . '/' . CACHE_FILE);
 $cacheReal = $cacheReal === false ? '' : strtolower(str_replace('\\', '/', $cacheReal));
+$commitReal = realpath($root . '/' . COMMIT_FILE);
+$commitReal = $commitReal === false ? '' : strtolower(str_replace('\\', '/', $commitReal));
 
 function resolve_token() {
     $env = getenv('PHPUSH_TOKEN');
@@ -29,6 +32,7 @@ function resolve_token() {
 function respond($code, array $payload) {
     http_response_code($code);
     header('Content-Type: application/json');
+    header('X-Content-Type-Options: nosniff');
     header('X-Robots-Tag: noindex, nofollow');
     echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -37,6 +41,7 @@ function respond($code, array $payload) {
 function respond_text($code, $body) {
     http_response_code($code);
     header('Content-Type: text/plain; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
     header('X-Robots-Tag: noindex, nofollow');
     echo $body;
     exit;
@@ -47,13 +52,29 @@ function read_token() {
     return '';
 }
 
+function state_read($path) {
+    if (!is_file($path)) return '';
+    $raw = @file_get_contents($path);
+    if ($raw === false) return '';
+    return preg_replace('/^<\?php.*?\?>\r?\n?/s', '', $raw, 1);
+}
+
+function state_write($path, $payload) {
+    $tmp = $path . TMP_SUFFIX;
+    if (@file_put_contents($tmp, STATE_GUARD . $payload, LOCK_EX) === false) return false;
+    if (!@rename($tmp, $path)) { @unlink($tmp); return false; }
+    @chmod($path, 0600);
+    return true;
+}
+
 function safe_target($root, $rel) {
-    if (!is_string($rel) || $rel === '' || strpos($rel, "\0") !== false) return false;
+    if (!is_string($rel) || $rel === '' || preg_match('/[\x00-\x1f]/', $rel)) return false;
     $rel = str_replace('\\', '/', $rel);
     $parts = [];
     foreach (explode('/', $rel) as $part) {
         if ($part === '' || $part === '.') continue;
         if ($part === '..') return false;
+        if (strpos($part, ':') !== false) return false;
         $parts[] = $part;
     }
     if (!$parts) return false;
@@ -67,7 +88,7 @@ function is_reserved_name($name) {
     return false;
 }
 
-function is_protected_target($target, array $protectedLower, $selfReal, $cacheReal) {
+function is_protected_target($target, array $protectedLower, $selfReal, $cacheReal, $commitReal) {
     $bn = rtrim(strtolower(basename($target)), " .");
     if (in_array($bn, $protectedLower, true)) return true;
     if (is_reserved_name($target)) return true;
@@ -76,6 +97,7 @@ function is_protected_target($target, array $protectedLower, $selfReal, $cacheRe
         $rt = strtolower(str_replace('\\', '/', $rt));
         if ($rt === $selfReal) return true;
         if ($cacheReal !== '' && $rt === $cacheReal) return true;
+        if ($commitReal !== '' && $rt === $commitReal) return true;
     }
     return false;
 }
@@ -154,9 +176,8 @@ $action = $_GET['action'] ?? '';
 if ($action === 'manifest') {
     $cachePath = $root . '/' . CACHE_FILE;
     $cache = [];
-    if (empty($_GET['fresh']) && is_file($cachePath)) {
-        $raw = @file_get_contents($cachePath);
-        $decoded = $raw === false ? null : json_decode($raw, true);
+    if (empty($_GET['fresh'])) {
+        $decoded = json_decode(state_read($cachePath), true);
         if (is_array($decoded)) $cache = $decoded;
     }
     $newCache = [];
@@ -178,13 +199,7 @@ if ($action === 'manifest') {
         $lines[] = $hash . "\t" . $rel;
     }
     $enc = json_encode($newCache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    if ($enc !== false) {
-        $tmpCache = $cachePath . TMP_SUFFIX;
-        if (@file_put_contents($tmpCache, $enc, LOCK_EX) !== false) {
-            @rename($tmpCache, $cachePath);
-            @chmod($cachePath, 0600);
-        }
-    }
+    if ($enc !== false) state_write($cachePath, $enc);
     respond_text(200, $lines ? implode("\n", $lines) . "\n" : '');
 }
 
@@ -194,7 +209,7 @@ if ($action === 'push') {
     }
     $rel = b64url_decode($_SERVER['HTTP_X_DEPLOY_PATH'] ?? '');
     $target = safe_target($root, $rel);
-    if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal)) {
+    if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
         respond(400, ['ok' => false, 'error' => 'rejected path']);
     }
     $append = (($_SERVER['HTTP_X_DEPLOY_MODE'] ?? 'w') === 'a');
@@ -211,6 +226,7 @@ if ($action === 'push') {
     }
     $tmp = $target . TMP_SUFFIX;
     if (is_link($tmp)) @unlink($tmp);
+    $existing = ($append && is_file($tmp)) ? (int) @filesize($tmp) : 0;
     $in = fopen('php://input', 'rb');
     $out = fopen($tmp, $append ? 'ab' : 'wb');
     if (!$in || !$out) {
@@ -229,7 +245,7 @@ if ($action === 'push') {
         $w = fwrite($out, $buf);
         if ($w === false) { $ok = false; break; }
         $bytes += $w;
-        if (MAX_PUSH_BYTES > 0 && $bytes > MAX_PUSH_BYTES) { $ok = false; $tooBig = true; break; }
+        if (MAX_PUSH_BYTES > 0 && ($existing + $bytes) > MAX_PUSH_BYTES) { $ok = false; $tooBig = true; break; }
     }
     fclose($in);
     fclose($out);
@@ -258,7 +274,7 @@ if ($action === 'delete') {
     if (is_array($list)) {
         foreach ($list as $rel) {
             $target = safe_target($root, $rel);
-            if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal)) {
+            if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
                 $errors[] = 'bad delete: ' . (is_string($rel) ? $rel : 'non-string');
                 continue;
             }
@@ -282,16 +298,12 @@ if ($action === 'commit') {
         if ($body !== '' && !preg_match('/^[0-9a-f]{40,64}$/', $body)) {
             respond(400, ['ok' => false, 'error' => 'bad commit id']);
         }
-        $tmp = $commitPath . TMP_SUFFIX;
-        if (@file_put_contents($tmp, $body) === false || !@rename($tmp, $commitPath)) {
-            @unlink($tmp);
+        if (!state_write($commitPath, $body)) {
             respond(500, ['ok' => false, 'error' => 'write failed']);
         }
-        @chmod($commitPath, 0600);
         respond(200, ['ok' => true, 'commit' => $body]);
     }
-    $current = is_file($commitPath) ? trim((string) @file_get_contents($commitPath)) : '';
-    respond(200, ['ok' => true, 'commit' => $current]);
+    respond(200, ['ok' => true, 'commit' => trim(state_read($commitPath))]);
 }
 
 respond(400, ['ok' => false, 'error' => 'unknown action']);

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,7 +23,7 @@ jobs:
         run: php -l phpush.php
 
       - name: ShellCheck client + tests
-        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh tests/modes.sh
+        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh tests/modes.sh tests/security.sh
 
       - name: Integration tests (working-tree mode)
         run: bash tests/run.sh
@@ -30,3 +33,6 @@ jobs:
 
       - name: Integration tests (mode interactions)
         run: bash tests/modes.sh
+
+      - name: Integration tests (security guards)
+        run: bash tests/security.sh

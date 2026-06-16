@@ -49,7 +49,7 @@ chk "absolute path did NOT escape root" "$([ -e /etc/sneaky.txt ] && echo escape
 chk "absolute path re-rooted inside"  "$([ -f "$ROOT/etc/sneaky.txt" ] && echo yes)" yes
 rm -rf "${ROOT:?}/etc"
 chk "case-insensitive PHPUSH.PHP -> 400" "$(PUSH 'PHPUSH.PHP' '<?php /*x*/')" 400
-chk "cache file push -> 400"          "$(PUSH '.phpush-cache.json' 'x')" 400
+chk "cache file push -> 400"          "$(PUSH '.phpush-cache.php' 'x')" 400
 chk "tmp-suffix push -> 400"          "$(PUSH 'x.phpush-tmp' 'x')" 400
 chk "receiver untouched after attacks" "$(shasum -a1 "$ROOT/phpush.php" | awk '{print $1}')" "$ORIG_RECEIVER_SHA"
 
@@ -91,8 +91,8 @@ verify_mirror && ok "every file byte-for-byte on server" || bad "mirror integrit
 chk "big.bin chunk-reassembled" "$(shasum -a1 assets/big.bin | awk '{print $1}')" "$(shasum -a1 "$ROOT/assets/big.bin" | awk '{print $1}')"
 chk "empty.txt present on server" "$([ -f "$ROOT/empty.txt" ] && echo yes)" yes
 chk ".deploy_secret NOT uploaded" "$([ -f "$ROOT/.deploy_secret" ] && echo leaked || echo safe)" safe
-chk "manifest cache file created" "$([ -f "$ROOT/.phpush-cache.json" ] && echo yes)" yes
-chk "cache not mirrored back / not deletable" "$(curl -s "${hdr_tok[@]}" "$BASE?action=manifest" | grep -c '.phpush-cache.json')" 0
+chk "manifest cache file created" "$([ -f "$ROOT/.phpush-cache.php" ] && echo yes)" yes
+chk "cache not mirrored back / not deletable" "$(curl -s "${hdr_tok[@]}" "$BASE?action=manifest" | grep -c '.phpush-cache.php')" 0
 
 DEPLOY_CHUNK_BYTES=1024 "$CLIENT" 2>/dev/null | grep -q "Already in sync" && ok "idempotent re-run" || bad "idempotent re-run"
 

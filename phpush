@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$REPO_ROOT" ] || { echo "error: run phpush from inside the git project you want to deploy" >&2; exit 1; }
@@ -11,6 +11,7 @@ DRY_RUN=0
 NO_DELETE=0
 REHASH=0
 GIT_MODE=0
+SECRET_FROM_FILE=0
 CHUNK_BYTES="${DEPLOY_CHUNK_BYTES:-1048576}"
 
 usage() {
@@ -102,6 +103,7 @@ load_secret() {
 if [ -z "${DEPLOY_URL:-}" ] || [ -z "${DEPLOY_TOKEN:-}" ]; then
     [ -f "$SECRET_FILE" ] || { echo "error: missing $SECRET_FILE — create it with DEPLOY_URL and DEPLOY_TOKEN (see PHPush/.deploy_secret.example)" >&2; exit 1; }
     load_secret "$SECRET_FILE"
+    SECRET_FROM_FILE=1
 fi
 : "${DEPLOY_URL:?DEPLOY_URL not set (env or .deploy_secret)}"
 : "${DEPLOY_TOKEN:?DEPLOY_TOKEN not set (env or .deploy_secret)}"
@@ -118,6 +120,17 @@ esac
 
 cd "$REPO_ROOT" || { echo "error: cannot cd into $REPO_ROOT" >&2; exit 1; }
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: not a git repository" >&2; exit 1; }
+
+if [ "$SECRET_FROM_FILE" -eq 1 ] && git ls-files --error-unmatch -- .deploy_secret >/dev/null 2>&1; then
+    echo "error: .deploy_secret is committed to this git repository — refusing." >&2
+    echo "       It holds your deploy token and must be gitignored. If this is NOT your repo, do not run phpush here." >&2
+    echo "       Otherwise:  git rm --cached .deploy_secret && echo .deploy_secret >> .gitignore" >&2
+    exit 1
+fi
+
+case "$DEPLOY_TOKEN" in
+    *$'\n'*|*$'\r'*) echo "error: DEPLOY_TOKEN contains a newline/carriage-return — refusing (it would corrupt the curl config)" >&2; exit 1 ;;
+esac
 
 b64url() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
 
@@ -267,7 +280,10 @@ plan_from_manifest() {
 
 add_local() {
     local rel="$1" src="$2" h
-    case "$rel" in .deploy_secret|.deploy_secret.example) return 0 ;; esac
+    case "$rel" in
+        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) return 0 ;;
+    esac
+    [ -L "$src" ] && { echo "warning: skipping symlink (not deployed): $rel" >&2; return 0; }
     bad_path "$rel" && return 0
     [ -f "$src" ] || return 0
     h="$(sha1_of "$src")"
@@ -311,6 +327,7 @@ if [ "$GIT_MODE" -eq 1 ]; then
         : > "$LOCAL_LIST"; local_count=0
         while IFS= read -r -d '' rel; do add_local "$rel" "$STAGING/$rel"; done < <(git ls-tree -r --name-only -z "$HEAD")
         [ "$bad_names" -eq 0 ] || { echo "error: rename the path(s) above and re-commit" >&2; exit 1; }
+        [ "$local_count" -gt 0 ] || { echo "error: commit ${HEAD:0:10} has no deployable files — refusing to wipe the server" >&2; exit 1; }
         fetch_manifest
         plan_from_manifest
     else
@@ -324,7 +341,7 @@ if [ "$GIT_MODE" -eq 1 ]; then
                 D*) IFS= read -r -d '' p
                     DELETES+=("$p") ;;
                 *)  IFS= read -r -d '' p
-                    case "$p" in .deploy_secret|.deploy_secret.example) continue ;; esac
+                    case "$p" in .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) continue ;; esac
                     bad_path "$p" || UPLOADS+=("$p") ;;
             esac
         done < <(git diff --name-status -z "$LAST" "$HEAD")
