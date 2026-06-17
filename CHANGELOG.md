@@ -4,6 +4,21 @@ All notable changes to PHPush are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-06-17
+
+### Fixed
+- **Client/server parity on `:`** — the client now skips a filename containing a
+  colon (legal on macOS/Linux, rejected by the receiver as an NTFS-stream guard)
+  with a clear warning, instead of marching to the server and failing the whole
+  deploy with a cryptic error.
+- **Legacy state cleanup** — the receiver removes any old unguarded
+  `.phpush-cache.json` / `.phpush-commit` left over from a pre-0.4.0 install, so an
+  in-place upgrade can't leave a web-readable inventory file behind.
+
+### Security
+- **CI actions are SHA-pinned** (`actions/checkout`, `shivammathur/setup-php`) so a
+  hijacked moving tag can't run untrusted code in CI.
+
 ## [0.4.0] — 2026-06-17
 
 A security-hardening release acting on an external review. Each fix has a
@@ -78,6 +93,7 @@ push-to-deploy mirror: token-gated PHP receiver plus a bash client that diffs by
 content hash, uploads only changed files in chunks, verifies by sha1, and mirrors
 deletions.
 
+[0.4.1]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.1
 [0.4.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.0
 [0.3.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.3.0
 [0.2.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.2.0

@@ -88,6 +88,20 @@ out="$( cd "$D" || exit 1; git rm -q nine.txt; git commit -qm emptied; "$CLIENT"
 echo "$out" | grep -qi 'refusing to wipe\|no deployable files' && ok "--git refused empty-tree commit" || bad "--git did not refuse empty tree"
 chk "server NOT wiped (nine.txt survives)" "$([ -f "$ROOT/nine.txt" ] && echo yes)" yes
 
+echo "== colon parity: client skips colon filenames; deploy still succeeds (no cryptic fail) =="
+D="$(newproj)"; out="$( cd "$D" || exit 1; printf 'ok\n' > good.txt; printf 'x\n' > 'a:b.txt'; "$CLIENT" 2>&1 )"; rc=$?
+echo "$out" | grep -qi "skipping 'a:b.txt'" && ok "colon file skipped with a clear warning" || bad "no clear colon warning"
+chk "deploy did NOT fail over the colon file (exit 0)" "$rc" 0
+chk "the normal file was deployed" "$([ -f "$ROOT/good.txt" ] && echo yes)" yes
+chk "colon file not pushed to server" "$([ -f "$ROOT/a:b.txt" ] && echo LEAKED || echo skipped)" skipped
+
+echo "== legacy state-file cleanup (v0.3 -> v0.4 upgrade) =="
+printf '{"old":"cache"}' > "$ROOT/.phpush-cache.json"
+printf '%040d' 1 > "$ROOT/.phpush-commit"
+curl -s "${hdr[@]}" "$BASE?action=manifest" >/dev/null
+chk "legacy .phpush-cache.json removed on run" "$([ -f "$ROOT/.phpush-cache.json" ] && echo present || echo gone)" gone
+chk "legacy .phpush-commit removed on run" "$([ -f "$ROOT/.phpush-commit" ] && echo present || echo gone)" gone
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

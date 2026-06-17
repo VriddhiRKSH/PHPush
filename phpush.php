@@ -171,6 +171,9 @@ if ($token === '' || !hash_equals($configuredToken, $token)) {
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
 }
 
+@unlink($root . '/.phpush-cache.json');
+@unlink($root . '/.phpush-commit');
+
 $action = $_GET['action'] ?? '';
 
 if ($action === 'manifest') {

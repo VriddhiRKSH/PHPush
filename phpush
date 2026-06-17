@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$REPO_ROOT" ] || { echo "error: run phpush from inside the git project you want to deploy" >&2; exit 1; }
@@ -284,6 +284,7 @@ add_local() {
         .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) return 0 ;;
     esac
     [ -L "$src" ] && { echo "warning: skipping symlink (not deployed): $rel" >&2; return 0; }
+    case "$rel" in *:*) echo "warning: skipping '$rel' — ':' is not allowed in deployed filenames (the server rejects it)" >&2; return 0 ;; esac
     bad_path "$rel" && return 0
     [ -f "$src" ] || return 0
     h="$(sha1_of "$src")"
@@ -335,13 +336,16 @@ if [ "$GIT_MODE" -eq 1 ]; then
             case "$status" in
                 R*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
                     bad_path "$newp" || DELETES+=("$oldp")
-                    bad_path "$newp" || UPLOADS+=("$newp") ;;
+                    case "$newp" in *:*) echo "warning: skipping rename to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 C*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
-                    bad_path "$newp" || UPLOADS+=("$newp") ;;
+                    case "$newp" in *:*) echo "warning: skipping copy to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 D*) IFS= read -r -d '' p
                     DELETES+=("$p") ;;
                 *)  IFS= read -r -d '' p
-                    case "$p" in .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) continue ;; esac
+                    case "$p" in
+                        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) continue ;;
+                        *:*) echo "warning: skipping '$p' — ':' is not allowed in deployed filenames" >&2; continue ;;
+                    esac
                     bad_path "$p" || UPLOADS+=("$p") ;;
             esac
         done < <(git diff --name-status -z "$LAST" "$HEAD")
