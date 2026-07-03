@@ -93,6 +93,17 @@ out="$(deploy 2>&1)"
 echo "$out" | grep -q "full resync" && ok "unknown server commit -> full resync" || bad "expected full resync on unknown cursor"
 chk "cursor restored to HEAD3" "$(server_cursor)" "$HEAD3"
 
+echo "== delete-path parity: deleting a committed colon-named file is skipped, deploy still completes =="
+printf 'x\n' > 'weird:name.txt'
+git add 'weird:name.txt' >/dev/null 2>&1
+git commit -q -m "add colon file"
+deploy >/dev/null 2>&1
+git rm -q 'weird:name.txt'
+git commit -q -m "remove colon file"
+out="$(deploy 2>&1)"; rc=$?
+echo "$out" | grep -qi "not deleting" && ok "colon delete skipped with a clear warning" || bad "no warning for colon delete"
+chk "deploy still completes (exit 0)" "$rc" 0
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

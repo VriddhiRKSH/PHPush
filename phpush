@@ -189,6 +189,15 @@ bad_path() {
     return 1
 }
 
+add_delete() {
+    case "$1" in
+        *"$NL"*|*"$TAB"*|*"$CR"*|*:*)
+            echo "warning: not deleting $(printf '%q' "$1") — its name has a ':' or control char, so PHPush could never have deployed it (nothing to remove)" >&2
+            return 0 ;;
+    esac
+    DELETES+=("$1")
+}
+
 push_chunk() {
     curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 600 \
         -H "X-Deploy-Path: $1" \
@@ -353,12 +362,12 @@ if [ "$GIT_MODE" -eq 1 ]; then
         while IFS= read -r -d '' status; do
             case "$status" in
                 R*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
-                    bad_path "$newp" || DELETES+=("$oldp")
+                    add_delete "$oldp"
                     case "$newp" in *:*) echo "warning: skipping rename to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 C*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
                     case "$newp" in *:*) echo "warning: skipping copy to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 D*) IFS= read -r -d '' p
-                    DELETES+=("$p") ;;
+                    add_delete "$p" ;;
                 *)  IFS= read -r -d '' p
                     case "$p" in
                         .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) continue ;;
