@@ -122,6 +122,15 @@ out="$( cd "$D" || exit 1; git rm -q nine.txt; git commit -qm emptied; "$CLIENT"
 echo "$out" | grep -qi 'refusing to wipe\|no deployable files' && ok "--git refused empty-tree commit" || bad "--git did not refuse empty tree"
 chk "server NOT wiped (nine.txt survives)" "$([ -f "$ROOT/nine.txt" ] && echo yes)" yes
 
+echo "== .deploy_secret parsing tolerates indentation, export, quotes, CRLF, trailing space =="
+D2="$(mktemp -d "$PROJS/p.XXXXXX")"
+( cd "$D2" || exit 1; git init -q .; git config user.email t@t; git config user.name t
+  printf '\texport DEPLOY_URL="%s"  \r\n  DEPLOY_TOKEN="%s"\r\n' "$BASE" "$TOKEN" > .deploy_secret
+  printf 'hi\n' > page.html
+  "$CLIENT" --dry-run > /tmp/phpush-parse.log 2>&1 ); rc=$?
+chk "client parsed a messy .deploy_secret (dry-run exit 0)" "$rc" 0
+grep -q 'page.html' /tmp/phpush-parse.log && ok "reached the plan with the parsed URL/token" || bad "did not parse the secret / connect"
+
 echo "== colon parity: client skips colon filenames; deploy still succeeds (no cryptic fail) =="
 D="$(newproj)"; out="$( cd "$D" || exit 1; printf 'ok\n' > good.txt; printf 'x\n' > 'a:b.txt'; "$CLIENT" 2>&1 )"; rc=$?
 echo "$out" | grep -qi "skipping 'a:b.txt'" && ok "colon file skipped with a clear warning" || bad "no clear colon warning"

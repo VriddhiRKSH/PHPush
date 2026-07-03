@@ -85,12 +85,15 @@ load_secret() {
         exit 1
     fi
     while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
         line="${line#export }"
         case "$line" in
             DEPLOY_URL=*) key=DEPLOY_URL; val="${line#DEPLOY_URL=}" ;;
             DEPLOY_TOKEN=*) key=DEPLOY_TOKEN; val="${line#DEPLOY_TOKEN=}" ;;
             *) continue ;;
         esac
+        val="${val%"${val##*[![:space:]]}"}"
         case "$val" in
             \"*\") val="${val#\"}"; val="${val%\"}" ;;
             \'*\') val="${val#\'}"; val="${val%\'}" ;;
