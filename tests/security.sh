@@ -60,6 +60,18 @@ echo "== #5: MAX_PUSH_BYTES is cumulative across append chunks (cap=100) =="
 chk "chunk1 50B (w) -> 200" "$(PUSH 'big.bin' "$(head -c 50 /dev/zero | tr '\0' A)" w 0)" 200
 chk "chunk2 60B (a) exceeds cap -> 413" "$(PUSH 'big.bin' "$(head -c 60 /dev/zero | tr '\0' B)" a 1)" 413
 
+echo "== client surfaces a 207 partial-delete failure (git mode) instead of ignoring it =="
+D="$(newproj)"
+( cd "$D" && mkdir -p sub && printf 'a\n' > sub/gone.html && printf 'b\n' > top.html
+  git add sub/gone.html top.html && git commit -qm c1 && "$CLIENT" --git >/dev/null 2>&1 )
+c1="$( cd "$D" && git rev-parse HEAD )"
+outside="$(mktemp -d)"; mv "$ROOT/sub" "$outside/sub"; ln -s "$outside/sub" "$ROOT/sub"
+( cd "$D" && git rm -q sub/gone.html && git commit -qm c2 && "$CLIENT" --git > /tmp/phpush-207.log 2>&1 ); rc=$?
+chk "deploy exits nonzero on rejected delete" "$rc" 1
+grep -qi 'rejected' /tmp/phpush-207.log && ok "207 partial-delete surfaced to the user" || bad "207 not surfaced to the user"
+chk "commit marker NOT advanced past the failed delete" "$(curl -s "${hdr[@]}" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p')" "$c1"
+rm -f "$ROOT/sub"; rm -rf "$outside"
+
 echo "== a non-UTF-8 filename does not void the whole manifest cache =="
 badname=$(printf 'bad_\xff_file.txt')
 if printf 'x' > "$ROOT/$badname" 2>/dev/null && [ -e "$ROOT/$badname" ]; then

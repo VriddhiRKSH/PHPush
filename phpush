@@ -270,10 +270,19 @@ run_deletes() {
     done
     json="$json]"
     echo "  deleting ${#DELETES[@]} file(s)..."
-    curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 120 \
+    local body code
+    body="$(curl -sS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 120 \
         -H "Content-Type: application/json" \
         --data-binary "$json" \
-        "$DEPLOY_URL?action=delete" >/dev/null || { echo "error: delete request failed" >&2; exit 1; }
+        -w $'\n%{http_code}' \
+        "$DEPLOY_URL?action=delete")" || { echo "error: delete request failed" >&2; delete_failures=1; return 1; }
+    code="${body##*$NL}"
+    body="${body%$NL*}"
+    if [ "$code" != "200" ]; then
+        echo "error: some deletes were rejected by the server (HTTP $code): $body" >&2
+        delete_failures=1
+        return 1
+    fi
 }
 
 fetch_manifest() {
@@ -388,6 +397,7 @@ else
 fi
 
 [ "$NO_DELETE" -eq 1 ] && DELETES=()
+delete_failures=0
 
 echo "Target : $DEPLOY_URL"
 if [ "$GIT_MODE" -eq 1 ]; then
@@ -432,14 +442,21 @@ if [ "$upload_failures" -gt 0 ]; then
     exit 1
 fi
 
-run_deletes
+run_deletes || true
 
 if [ "$GIT_MODE" -eq 1 ]; then
-    curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 60 \
-        -H "Content-Type: text/plain" --data-binary "$HEAD" \
-        "$DEPLOY_URL?action=commit" >/dev/null \
-        || echo "WARNING: deploy succeeded but updating the commit marker failed — next run may re-send these files." >&2
-    echo "Done. The server now matches commit ${HEAD:0:10}."
+    if [ "$delete_failures" -eq 0 ]; then
+        curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 60 \
+            -H "Content-Type: text/plain" --data-binary "$HEAD" \
+            "$DEPLOY_URL?action=commit" >/dev/null \
+            || echo "WARNING: deploy succeeded but updating the commit marker failed — next run may re-send these files." >&2
+        echo "Done. The server now matches commit ${HEAD:0:10}."
+    else
+        echo "WARNING: some deletes were rejected — the server does NOT match commit ${HEAD:0:10}; the commit marker was NOT advanced. Re-run to retry." >&2
+    fi
 else
-    echo "Done. The server now mirrors your working tree."
+    [ "$delete_failures" -eq 0 ] && echo "Done. The server now mirrors your working tree." \
+        || echo "WARNING: some deletes were rejected — the server does not fully mirror your working tree. Re-run to retry." >&2
 fi
+
+[ "$delete_failures" -eq 0 ] || exit 1
