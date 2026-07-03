@@ -4,6 +4,60 @@ All notable changes to PHPush are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-07-03
+
+A correctness + hardening release acting on a full multi-lens review, plus two
+adoption features. Client and receiver should be upgraded together (the client
+now warns on a version mismatch).
+
+### Security
+- **Token-exfiltration fix (client).** The cleartext-`http` localhost exception
+  used unanchored globs, so `http://127.0.0.1@evil.example/…` and
+  `http://127.0.0.1.evil.example/…` slipped through as "localhost (testing only)"
+  and sent the deploy token to a remote host in the clear. The client now parses
+  the authority, rejects `@`-userinfo, and matches the localhost host exactly.
+- **Chunk-offset integrity (receiver).** Uploads carry `X-Deploy-Offset`; the
+  receiver verifies it against the current temp size before appending, so a stale
+  `.phpush-tmp` can no longer be concatenated into a file that then reports a
+  valid sha1. Interrupted uploads are now safely resumable.
+
+### Fixed
+- **Nested files sharing a reserved basename** (`libs/phpush.php`,
+  `vendor/x/phpush.php`) were rejected on push and hidden from the manifest, so
+  the deploy could never reach sync. Self-protection is now scoped to the deploy
+  root; the `realpath` identity check still guards the real receiver/state files.
+- **`--git --no-delete` no longer poisons the commit cursor.** It kept the marker
+  where it was reporting sync while the removed files were still on the server; a
+  later `--git` run then never reconciled them. The cursor now stays put when
+  deletes are suppressed, so a normal run reconciles them.
+- **Deterministic `--git` mirror.** Full resync used `git archive|tar` (honoring
+  `export-ignore`, materializing symlinks) while incremental used `git diff`/`git
+  show` (honoring neither), so the same commit could deploy a different tree. Both
+  now deploy exactly `git ls-tree -r HEAD`, skip symlinks/submodules
+  consistently, and no longer need `tar`.
+- **Partial-delete (`207`) failures are surfaced.** The client treated `207` as
+  success and (in `--git`) advanced the cursor past deletes the server rejected;
+  it now reports them, leaves the cursor, and exits non-zero.
+- **Legacy state cleanup no longer deletes user files.** The v0.3→v0.4 cleanup
+  unconditionally removed any `.phpush-cache.json` / `.phpush-commit`; it now only
+  removes files matching the legacy format when the new-format state exists.
+- **Delete-path parity.** Delete paths (incl. rename old-paths) are validated for
+  `:`/control chars like uploads, instead of silently dropping.
+- **One non-UTF-8 filename** no longer voids the entire manifest cache (only that
+  path is skipped from caching), and multi-chunk uploads report the full byte
+  count.
+- **`.deploy_secret` parsing** tolerates indentation, `export`, CRLF, and
+  trailing whitespace.
+
+### Added
+- **`?action=version` handshake** — reports the receiver version and whether
+  PHPush has deployed here; the client warns on version skew.
+- **First-deploy `--adopt` guard** — the client refuses a first deploy that would
+  delete pre-existing files on an unmanaged server unless you pass `--adopt`
+  (take over) or `--no-delete` (add alongside).
+- **`.pushignore`** — a deploy-only exclude list (practical glob subset) that
+  keeps files out of the published tree in both modes without touching git.
+
 ## [0.4.1] — 2026-06-17
 
 ### Fixed
@@ -93,6 +147,7 @@ push-to-deploy mirror: token-gated PHP receiver plus a bash client that diffs by
 content hash, uploads only changed files in chunks, verifies by sha1, and mirrors
 deletions.
 
+[0.5.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.5.0
 [0.4.1]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.1
 [0.4.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.0
 [0.3.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.3.0

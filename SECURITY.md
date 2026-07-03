@@ -74,15 +74,25 @@ be audited.
 - **Self-protection** — the receiver and its cache/commit files cannot be
   overwritten or deleted through the endpoint, including via **case-folding tricks**
   (`PHPUSH.PHP`) on case-insensitive filesystems (macOS/Windows hosts).
-- **Half-written files** — uploads are streamed to a temporary file and
-  **atomically renamed** into place only when complete, so visitors never see a
-  partially written file and a dropped connection can't truncate a live one. An
-  optional `MAX_PUSH_BYTES` cap is enforced cumulatively across chunked appends.
+- **Half-written / corrupted files** — uploads are streamed to a temporary file
+  and **atomically renamed** into place only when complete, so visitors never see
+  a partially written file and a dropped connection can't truncate a live one.
+  Chunked uploads carry an `X-Deploy-Offset` the receiver verifies before
+  appending, so a stale temp left by an aborted upload can't be concatenated into
+  the next file. An optional `MAX_PUSH_BYTES` cap is enforced cumulatively across
+  chunked appends.
 - **Cleartext token leaks** — the client refuses non-HTTPS targets (except
-  explicit localhost for testing), passes the token to `curl` via a private
-  config file (never on the command line, so it isn't visible in the process
-  list), never accepts the token in a URL query string, and rejects a token
-  containing newlines (which could inject curl directives).
+  explicit localhost for testing, matched on the **exact host** so
+  `http://127.0.0.1@evil.example` / `http://127.0.0.1.evil.example` can't smuggle
+  the token to a remote host), passes the token to `curl` via a private config
+  file (never on the command line, so it isn't visible in the process list),
+  never accepts the token in a URL query string, and rejects a token containing
+  newlines (which could inject curl directives).
+- **Accidental first-run wipe** — a `?action=version` handshake reports whether
+  PHPush has ever deployed to a directory. The client refuses a first deploy that
+  would delete pre-existing files on an unmanaged server unless you pass
+  `--adopt` (or `--no-delete`), so pointing PHPush at a populated site can't
+  silently mirror-delete it.
 - **Untrusted-repo safety (client)** — running `phpush` inside a hostile repo is
   guarded: it **refuses** a `.deploy_secret` that's been committed to the repo
   (yours should be gitignored), and it **skips symlinks** rather than following
@@ -95,8 +105,9 @@ be audited.
   that isn't gitignored, so a tracked or untracked-but-not-ignored `.env`,
   `*.sql` dump, `composer.lock`, `tests/`, or `.github/` will be published to the
   public web root. Review `phpush --dry-run` before the first deploy, and gitignore
-  anything that shouldn't be public. (A `.pushignore` exclude list is on the
-  roadmap.)
+  anything that shouldn't be public. To keep files that *are* in git out of the
+  published tree (raw sources, `tests/`, `README`), add a `.pushignore` — but for
+  actual secrets, `.gitignore` remains the real gate.
 - **`ALLOW_IPS` uses `REMOTE_ADDR`.** That's correct on a normal server, but
   behind Cloudflare or any reverse proxy `REMOTE_ADDR` is the *proxy's* address —
   so the allowlist will either block everyone or effectively trust everyone. Treat
