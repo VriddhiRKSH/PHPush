@@ -93,6 +93,24 @@ out="$(deploy 2>&1)"
 echo "$out" | grep -q "full resync" && ok "unknown server commit -> full resync" || bad "expected full resync on unknown cursor"
 chk "cursor restored to HEAD3" "$(server_cursor)" "$HEAD3"
 
+echo "== --git deploys the committed tree deterministically (export-ignore + symlinks) =="
+printf 'devnote.txt export-ignore\n' > .gitattributes
+printf 'internal\n' > devnote.txt
+ln -s index.html link.html
+git add .gitattributes devnote.txt link.html
+git commit -q -m "export-ignore + symlink"
+deploy --rehash >/dev/null 2>&1
+chk "resync: export-ignored file IS deployed" "$(srv_sha devnote.txt)" "$(head_sha_of devnote.txt)"
+chk "resync: symlink NOT deployed" "$([ -e "$ROOT/link.html" ] && echo present || echo absent)" absent
+printf 'internal v2\n' > devnote.txt
+git commit -q -am "edit devnote"
+deploy >/dev/null 2>&1
+chk "incremental: export-ignored file still deployed + matches" "$(srv_sha devnote.txt)" "$(head_sha_of devnote.txt)"
+ln -sf keep.txt link.html
+git commit -q -am "repoint symlink"
+deploy >/dev/null 2>&1
+chk "incremental: symlink still NOT deployed as a file" "$([ -e "$ROOT/link.html" ] && echo present || echo absent)" absent
+
 echo "== delete-path parity: deleting a committed colon-named file is skipped, deploy still completes =="
 printf 'x\n' > 'weird:name.txt'
 git add 'weird:name.txt' >/dev/null 2>&1
