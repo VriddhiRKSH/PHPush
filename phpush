@@ -194,28 +194,30 @@ push_chunk() {
         -H "X-Deploy-Path: $1" \
         -H "X-Deploy-Mode: $2" \
         -H "X-Deploy-Final: $3" \
+        -H "X-Deploy-Offset: $5" \
         -H "Content-Type: application/octet-stream" \
         --data-binary "@$4" \
         "$DEPLOY_URL?action=push"
 }
 
 upload_one() {
-    local rel="$1" src="$2" size b64 want resp chunkno offset mode final
+    local rel="$1" src="$2" size b64 want resp chunkno chunk_start offset mode final
     size="$(size_of "$src")"
     b64="$(b64url "$rel")"
     want="$(sha1_of "$src")"
     case "$size" in ''|*[!0-9]*) echo "  ! cannot size: $rel" >&2; return 1 ;; esac
     [ -n "$want" ] || { echo "  ! cannot hash: $rel" >&2; return 1; }
     if [ "$size" -le "$CHUNK_BYTES" ]; then
-        resp="$(push_chunk "$b64" w 1 "$src")" || return 1
+        resp="$(push_chunk "$b64" w 1 "$src" 0)" || return 1
     else
         chunkno=0
         while :; do
             [ "$chunkno" -eq 0 ] && mode=w || mode=a
+            chunk_start=$(( chunkno * CHUNK_BYTES ))
             dd if="$src" of="$TMPDIR_WORK/chunk" bs="$CHUNK_BYTES" skip="$chunkno" count=1 2>/dev/null
             offset=$(( (chunkno + 1) * CHUNK_BYTES ))
             [ "$offset" -ge "$size" ] && final=1 || final=0
-            resp="$(push_chunk "$b64" "$mode" "$final" "$TMPDIR_WORK/chunk")" || return 1
+            resp="$(push_chunk "$b64" "$mode" "$final" "$TMPDIR_WORK/chunk" "$chunk_start")" || return 1
             chunkno=$((chunkno + 1))
             [ "$final" -eq 1 ] && break
         done

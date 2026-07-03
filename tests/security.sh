@@ -60,6 +60,16 @@ echo "== #5: MAX_PUSH_BYTES is cumulative across append chunks (cap=100) =="
 chk "chunk1 50B (w) -> 200" "$(PUSH 'big.bin' "$(head -c 50 /dev/zero | tr '\0' A)" w 0)" 200
 chk "chunk2 60B (a) exceeds cap -> 413" "$(PUSH 'big.bin' "$(head -c 60 /dev/zero | tr '\0' B)" a 1)" 413
 
+echo "== chunk offset guard: appending onto a stale/wrong-size temp is refused =="
+printf 'STALEDATA' > "$ROOT/foo.txt.phpush-tmp"
+off() { curl -s -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST -H "X-Deploy-Path: $(b64u "$1")" -H "X-Deploy-Mode: $2" -H "X-Deploy-Final: $3" -H "X-Deploy-Offset: $4" --data-binary "$5" "$BASE?action=push"; }
+chk "stale-temp append at offset 0 -> 409" "$(off 'foo.txt' a 1 0 'NEWDATA')" 409
+chk "no corrupt foo.txt was finalized" "$([ -f "$ROOT/foo.txt" ] && echo present || echo absent)" absent
+chk "stale temp removed on mismatch" "$([ -f "$ROOT/foo.txt.phpush-tmp" ] && echo present || echo gone)" gone
+off 'bar.txt' w 0 0 'AAA' >/dev/null
+chk "resume chunk at matching offset -> 200" "$(off 'bar.txt' a 1 3 'BBB')" 200
+chk "resumed bar.txt content correct" "$(cat "$ROOT/bar.txt" 2>/dev/null)" 'AAABBB'
+
 echo "== #8a: client skips symlinks (no exfiltration) =="
 SECRET="$(mktemp)"; echo 'PRIVATE-KEY' > "$SECRET"
 D="$(newproj)"; ( cd "$D" || exit 1; printf 'real\n' > real.txt; ln -s "$SECRET" leak.txt; "$CLIENT" >/dev/null 2>&1 )

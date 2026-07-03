@@ -254,6 +254,13 @@ if ($action === 'push') {
     $tmp = $target . TMP_SUFFIX;
     if (is_link($tmp)) @unlink($tmp);
     $existing = ($append && is_file($tmp)) ? (int) @filesize($tmp) : 0;
+    if (isset($_SERVER['HTTP_X_DEPLOY_OFFSET'])) {
+        $offset = (int) $_SERVER['HTTP_X_DEPLOY_OFFSET'];
+        if ($offset !== ($append ? $existing : 0)) {
+            @unlink($tmp);
+            respond(409, ['ok' => false, 'error' => 'chunk offset mismatch']);
+        }
+    }
     $in = fopen('php://input', 'rb');
     $out = fopen($tmp, $append ? 'ab' : 'wb');
     if (!$in || !$out) {
