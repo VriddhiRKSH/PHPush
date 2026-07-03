@@ -108,15 +108,31 @@ fi
 : "${DEPLOY_URL:?DEPLOY_URL not set (env or .deploy_secret)}"
 : "${DEPLOY_TOKEN:?DEPLOY_TOKEN not set (env or .deploy_secret)}"
 
+url_authority="${DEPLOY_URL#*://}"
+url_authority="${url_authority%%/*}"
+url_authority="${url_authority%%\?*}"
+url_authority="${url_authority%%#*}"
+case "$url_authority" in
+    *@*) echo "error: DEPLOY_URL must not contain userinfo ('@' before the host) — refusing (it can point the token at an attacker host)" >&2; exit 1 ;;
+esac
+case "$url_authority" in
+    \[*\]*) url_host="${url_authority%%\]*}]" ;;
+    *:*)    url_host="${url_authority%%:*}" ;;
+    *)      url_host="$url_authority" ;;
+esac
 case "$DEPLOY_URL" in
     https://*) ;;
-    http://127.0.0.1*|http://localhost*|'http://[::1]'*)
-        echo "warning: DEPLOY_URL uses insecure http to localhost (testing only)" >&2 ;;
     http://*)
-        echo "error: DEPLOY_URL must use https:// — refusing to send the token over cleartext http" >&2; exit 1 ;;
+        case "$url_host" in
+            127.0.0.1|localhost|'[::1]')
+                echo "warning: DEPLOY_URL uses insecure http to localhost (testing only)" >&2 ;;
+            *)
+                echo "error: DEPLOY_URL must use https:// — refusing to send the token over cleartext http (host: $url_host)" >&2; exit 1 ;;
+        esac ;;
     *)
         echo "error: DEPLOY_URL must start with https:// (got: $DEPLOY_URL)" >&2; exit 1 ;;
 esac
+unset url_authority url_host
 
 cd "$REPO_ROOT" || { echo "error: cannot cd into $REPO_ROOT" >&2; exit 1; }
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: not a git repository" >&2; exit 1; }

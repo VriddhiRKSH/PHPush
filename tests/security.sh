@@ -95,6 +95,23 @@ chk "deploy did NOT fail over the colon file (exit 0)" "$rc" 0
 chk "the normal file was deployed" "$([ -f "$ROOT/good.txt" ] && echo yes)" yes
 chk "colon file not pushed to server" "$([ -f "$ROOT/a:b.txt" ] && echo LEAKED || echo skipped)" skipped
 
+echo "== token-leak guard: http exception matches the host exactly (no unanchored-glob bypass) =="
+D="$(newproj)"; ( cd "$D" && printf 'x\n' > f.txt )
+for badurl in \
+  'http://127.0.0.1@evil.example/phpush.php' \
+  'http://127.0.0.1.evil.example/phpush.php' \
+  'http://localhost.evil.example/phpush.php' \
+  'http://127.0.0.1:80@evil.example/phpush.php' ; do
+    out="$( cd "$D" && DEPLOY_URL="$badurl" DEPLOY_TOKEN="$TOKEN" "$CLIENT" 2>&1 )"; rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'refusing\|must use https\|userinfo'; then
+        ok "refused cleartext http to $badurl"
+    else
+        bad "did NOT refuse $badurl (rc=$rc)"
+    fi
+done
+out="$( cd "$D" && DEPLOY_URL="http://127.0.0.1:$PORT/phpush.php" DEPLOY_TOKEN="$TOKEN" "$CLIENT" --dry-run 2>&1 )"
+printf '%s' "$out" | grep -qi 'must use https\|refusing' && bad "genuine localhost http wrongly refused" || ok "genuine http://127.0.0.1 still allowed"
+
 echo "== legacy state-file cleanup (v0.3 -> v0.4 upgrade) =="
 printf '{"old":"cache"}' > "$ROOT/.phpush-cache.json"
 printf '%040d' 1 > "$ROOT/.phpush-commit"
