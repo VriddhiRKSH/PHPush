@@ -3,17 +3,33 @@
 [![CI](https://github.com/VriddhiRKSH/PHPush/actions/workflows/ci.yml/badge.svg)](https://github.com/VriddhiRKSH/PHPush/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Git-style deploys for hosts that don't even give you FTP.**
+**`git push`-style deploys for any host that runs PHP — over plain HTTPS.**
 
-PHPush pushes your local git project to a web host over plain HTTPS — no
-FTP, no SSH, no shell on the server. You upload **one** small, token-protected
-PHP file through whatever the host gives you (a cPanel/Plesk File Manager is
-enough), and from then on a single local command mirrors your project up to it:
-content-hash diff, only changed files, chunked uploads, atomic writes, and
-deletion of files you removed — so the server always matches your project.
+PHPush mirrors your local project to a web host with a single command:
+content-hash diff, only changed files uploaded, chunked uploads, atomic writes,
+and deletion of files you removed — so the server always matches your project.
+The whole transport is one small, token-protected PHP file you drop on the host
+once; from then on `phpush` feels like pushing to a remote.
 
 It needs nothing on the host but the ability to serve PHP. No git, no shell, no
 `exec`, no FTP, no SFTP.
+
+### Who it's for
+
+- **You only have a File Manager.** Cheap/locked-down shared hosting (often a
+  client's cPanel/Plesk) can give you *only* a web File Manager — no FTP, no
+  SFTP, no SSH. PHPush is the rescue tool: upload one file through the browser
+  and you have push-to-deploy where there was none.
+- **You'd rather not touch FTP.** Even if the host offers SFTP, you may not want
+  to wire up an FTP client, juggle credentials, or drag files by hand. PHPush is
+  one command over HTTPS you already trust for the site.
+- **You want a `git push` feel on cheap hosting.** No CI runner, no SSH keys, no
+  Deployer/Capistrano setup — just `phpush` (working tree) or `phpush --git`
+  (your last commit) and the site updates incrementally.
+
+If your host gives you SFTP and you're happy with a mature FTP deployer
+(`git-ftp`, PHPloy), those are great too — PHPush's niche is *no transport but
+PHP*, and *preferring a single push command* to anything heavier.
 
 ## Demo
 
@@ -66,6 +82,7 @@ Done. The server now matches commit 79885368da.
 | `phpush.php` | on the server (uploaded once) | **Receiver.** Token-gated endpoint that writes/deletes files. Deliberately dumb and auditable — it only moves bytes. |
 | `phpush` | on your machine | **Client.** Mirrors the current git project to the receiver over HTTPS. All the intelligence (diffing, chunking, verification) lives here. |
 | `.deploy_secret` | your project root (gitignored) | Your `DEPLOY_URL` + `DEPLOY_TOKEN`. |
+| `.pushignore` | your project root (optional) | Globs to keep out of the deploy (not uploaded, not deleted). |
 
 ## Requirements
 
@@ -159,38 +176,86 @@ releases. These exact interactions are pinned down in `tests/modes.sh`.
 | `--git` | Deploy the last commit instead of the working tree (aliases: `--commit`, `--committed`). |
 | `-n`, `--dry-run` | Show what would upload/delete; change nothing. |
 | `--no-delete` | Upload changes but never delete server files. |
+| `--adopt` | Allow a **first** deploy to delete pre-existing files on a server PHPush has never deployed to (needed to take over an existing site — see below). |
 | `--rehash` | Working-tree: ignore the server's hash cache. `--git`: force a full resync. |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
 You can also override `DEPLOY_CHUNK_BYTES` (default `1048576`, i.e. 1 MB) if your
 host's `post_max_size` is unusually small or large.
 
+### Deploying to a site that already has files (`--adopt`)
+
+Because deploys **mirror**, the first run against a directory that already has
+content would delete everything not in your project. PHPush guards against this:
+it remembers when it has deployed to a server, and if the **first** deploy would
+delete pre-existing files, it stops and asks you to choose:
+
+```console
+$ phpush
+error: the server has 12 file(s) PHPush has never deployed, and this run would
+       DELETE them to mirror your project.
+       To take over this directory (this WILL delete those files):  re-run with --adopt
+       To upload without deleting anything:                         re-run with --no-delete
+       To review exactly what would change first:                   phpush --dry-run
+```
+
+Run `phpush --dry-run` to see the plan, then `--adopt` to take over or
+`--no-delete` to add your files alongside the existing ones.
+
+### Excluding files from deploy (`.pushignore`)
+
+Your `.gitignore` controls what leaves your machine, but sometimes you want files
+in git that shouldn't be *published* — `tests/`, `.github/`, raw sources, a
+`README`. Add a `.pushignore` at your project root (one glob per line):
+
+```gitignore
+# never deploy these
+*.log
+tests/
+.github/
+node_modules/
+README.md
+```
+
+Matched files are neither uploaded nor deleted, in both modes. `.pushignore` and
+`.deploy_secret` are always excluded. (Supported globs are a practical subset:
+`*.log`, `dir/`, and `path/*.css` — not the full `.gitignore` grammar.)
+
 ## How it stays safe
 
 - **Token never leaks into logs or the process list.** It's sent only as a header
-  over HTTPS (the client refuses non-HTTPS targets), passed to `curl` via a
-  private config file, and never accepted in a URL.
+  over HTTPS (the client refuses non-HTTPS targets, rejecting `@`-userinfo and
+  look-alike-host tricks so `http://127.0.0.1@evil.example` can't smuggle it to a
+  remote host), passed to `curl` via a private config file, and never in a URL.
 - **Confined writes.** The receiver rejects `..`, absolute escapes, null bytes,
   and — via `realpath()` — symlinks that would write or delete outside its
   directory. It also protects itself from being overwritten or deleted, including
   case-folding tricks (`PHPUSH.PHP`) on macOS/Windows hosts.
 - **Atomic, verified uploads.** Each file streams to a temp file and is renamed
   into place only when complete (no half-written files), then verified end-to-end
-  by sha1. Large files are chunked to stay under PHP upload limits.
+  by sha1. Chunk offsets are checked so a stale temp can't corrupt a file. Large
+  files are chunked to stay under PHP upload limits.
+- **No accidental first-run wipe.** A version/status handshake lets the client
+  detect a server it has never deployed to and refuse to delete pre-existing
+  files without `--adopt` (see above).
 
 Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 
 ## Notes
 
 - Only git-tracked (and untracked-but-not-ignored) files are deployed; ignored
-  files and `.deploy_secret` never leave your machine.
-- **Your `.gitignore` is your secrets safety net.** Anything not gitignored gets
-  published to the public web root — so gitignore secrets like `.env` and DB
-  dumps, and run `--dry-run` before the first deploy to a real site. PHPush also
-  skips symlinks and refuses a `.deploy_secret` you've accidentally committed.
+  files, `.pushignore` matches, and `.deploy_secret` never leave your machine.
+- **Your `.gitignore` is your secrets safety net.** Anything not gitignored (and
+  not `.pushignore`d) gets published to the public web root — so gitignore secrets
+  like `.env` and DB dumps, and run `--dry-run` before the first deploy to a real
+  site. PHPush also skips symlinks and refuses a `.deploy_secret` you've
+  accidentally committed.
 - **Deploys mirror.** Files you removed locally are removed on the server (use
   `--no-delete` to keep them). The server ends up matching your working tree
-  exactly — review `--dry-run` before the first run on an existing site.
+  exactly. The first deploy to a directory that already has files needs `--adopt`
+  (or `--no-delete`) — review `--dry-run` first.
+- Keep the client (`phpush`) and receiver (`phpush.php`) on the **same version**;
+  the client prints a note if they differ. Re-upload `phpush.php` after upgrading.
 - The server caches file hashes by size+mtime, so repeat deploys don't re-hash
   the whole tree. If you ever rewrite a file's contents without changing its size
   or mtime, run once with `--rehash`.
@@ -204,7 +269,8 @@ tests/git.sh        # --git mode: cursor, incremental, add/delete/rename, resync
 tests/modes.sh      # mixing the two modes: uncommitted vs committed, drift, --rehash
 tests/security.sh   # hardening regressions: metadata privacy, path guards, no-wipe, exfil
 ```
-Each spins up `php -S` locally and needs no network. CI runs all four on every push.
+Each spins up `php -S` locally and needs no network. CI runs all four (plus
+`php -l` and `shellcheck`) on every push.
 
 ## Changelog & security
 
