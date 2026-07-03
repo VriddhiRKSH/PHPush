@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+RECEIVER="$HERE/phpush.php"
+CLIENT="$HERE/phpush"
+PORT="${PHPUSH_TEST_PORT:-8798}"
+BASE="http://127.0.0.1:$PORT/phpush.php"
+TOKEN="$(openssl rand -hex 32 2>/dev/null || printf '%064d' 1)"
+
+pass=0; fail=0
+ok()  { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
+bad() { fail=$((fail+1)); printf '  FAIL %s\n' "$1" >&2; }
+chk() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want [$3] got [$2])"; fi; }
+
+ROOT="$(mktemp -d)"; PROJ="$(mktemp -d)"; GP="$(mktemp -d)"; SRV_PID=""
+cleanup() { [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; }; rm -rf "$ROOT" "$PROJ" "$GP"; }
+trap cleanup EXIT
+
+# MAX_BACKUPS lowered to 3 so pruning is cheap to exercise.
+sed -e "s/__PASTE_64_HEX_TOKEN_HERE__/$TOKEN/" -e 's/const MAX_BACKUPS = 10;/const MAX_BACKUPS = 3;/' "$RECEIVER" > "$ROOT/phpush.php"
+php -S "127.0.0.1:$PORT" -t "$ROOT" >/tmp/phpush-backup-srv.log 2>&1 &
+SRV_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "$BASE" && break; sleep 0.3; done
+
+hdr=(-H "X-Deploy-Token: $TOKEN")
+sv()   { cat "$ROOT/$1" 2>/dev/null || true; }
+has()  { [ -e "$ROOT/$1" ] && echo PRESENT || echo ABSENT; }
+run()  { ( cd "$PROJ" && "$CLIENT" "$@" 2>&1 | tr '\r' '\n' | grep -vE '^  uploading' ) || true; }
+snapcount() { curl -s "${hdr[@]}" "$BASE?action=backups" | grep -o '"id":"[^"]*"' | wc -l | tr -d ' '; }
+
+cd "$PROJ" || exit 1
+git init -q .; git config user.email t@t; git config user.name t
+printf 'DEPLOY_URL="%s"\nDEPLOY_TOKEN="%s"\n' "$BASE" "$TOKEN" > .deploy_secret
+
+echo "== a deploy that overwrites/adds/deletes can be rolled back exactly =="
+printf 'A\n' > index.html; printf 'K\n' > keep.txt
+run >/dev/null
+chk "v1 index deployed" "$(sv index.html)" "A"
+sleep 1
+printf 'B\n' > index.html; printf 'N\n' > new.txt; rm keep.txt
+run >/dev/null
+chk "v2 index overwritten" "$(sv index.html)" "B"
+chk "v2 new file added"    "$(has new.txt)" "PRESENT"
+chk "v2 deleted keep.txt"  "$(has keep.txt)" "ABSENT"
+run --rollback >/dev/null
+chk "rollback restored old index"        "$(sv index.html)" "A"
+chk "rollback removed the added file"    "$(has new.txt)" "ABSENT"
+chk "rollback restored the deleted file" "$(sv keep.txt)" "K"
+# re-sync the working tree to the rolled-back server so the next block is clean
+printf 'A\n' > index.html; printf 'K\n' > keep.txt; rm -f new.txt
+
+echo "== --list-backups shows snapshots; --rollback --dry-run changes nothing =="
+out="$(run --list-backups)"
+echo "$out" | grep -qi 'snapshot' && ok "list-backups prints snapshots" || bad "list-backups printed nothing"
+sleep 1
+printf 'B2\n' > index.html
+run >/dev/null
+chk "change deployed" "$(sv index.html)" "B2"
+out="$(run --rollback --dry-run)"
+echo "$out" | grep -qi 'dry run' && ok "dry-run rollback says dry run" || bad "no dry-run marker"
+chk "dry-run did NOT touch the server" "$(sv index.html)" "B2"
+run --rollback >/dev/null
+chk "real rollback reverted the change" "$(sv index.html)" "A"
+printf 'A\n' > index.html
+
+echo "== --no-backup records no new snapshot =="
+before="$(snapcount)"
+sleep 1
+printf 'D\n' > index.html
+run --no-backup >/dev/null
+chk "server took the change" "$(sv index.html)" "D"
+chk "no new snapshot recorded" "$(snapcount)" "$before"
+
+echo "== snapshots are pruned to MAX_BACKUPS (=3 here) =="
+for i in 1 2 3 4 5; do sleep 1; printf 'P%s\n' "$i" > index.html; run >/dev/null; done
+chk "snapshot count capped at MAX_BACKUPS" "$(snapcount)" "3"
+
+echo "== backup area is invisible and protected =="
+chk "backups never appear in the manifest" "$(curl -s "${hdr[@]}" "$BASE?action=manifest" | grep -c 'phpush-backups')" 0
+chk "the mirror never deletes the backup dir" "$([ -d "$ROOT/.phpush-backups" ] && echo yes)" yes
+chk "backup dir carries an .htaccess deny"    "$([ -f "$ROOT/.phpush-backups/.htaccess" ] && echo yes)" yes
+
+echo "== --git rollback also restores the commit cursor =="
+cur() { curl -s "${hdr[@]}" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p'; }
+gsv() { cat "$ROOT/$1" 2>/dev/null || true; }
+( cd "$GP" && git init -q . && git config user.email t@t && git config user.name t \
+  && printf 'DEPLOY_URL="%s"\nDEPLOY_TOKEN="%s"\n' "$BASE" "$TOKEN" > .deploy_secret \
+  && printf 'g1\n' > gpage.html && git add gpage.html && git commit -qm c1 && "$CLIENT" --git --rehash >/dev/null 2>&1 )
+H1="$( cd "$GP" && git rev-parse HEAD )"
+chk "git deploy set cursor to c1" "$(cur)" "$H1"
+sleep 1
+( cd "$GP" && printf 'g2\n' > gpage.html && git commit -qm c2 gpage.html && "$CLIENT" --git >/dev/null 2>&1 )
+H2="$( cd "$GP" && git rev-parse HEAD )"
+chk "git deploy advanced cursor to c2" "$(cur)" "$H2"
+( cd "$GP" && "$CLIENT" --git --rollback >/dev/null 2>&1 )
+chk "rollback restored page content to g1" "$(gsv gpage.html)" "g1"
+chk "rollback restored the commit cursor to c1" "$(cur)" "$H1"
+
+echo
+echo "passed: $pass   failed: $fail"
+[ "$fail" -eq 0 ]
