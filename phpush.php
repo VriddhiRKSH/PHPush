@@ -263,11 +263,14 @@ function snapshot_dir($root, $snapshotId) {
 function backup_before_overwrite($root, $snapshotId, $rel, $target) {
     if (MAX_BACKUPS <= 0 || $snapshotId === '') return;
     $base = snapshot_dir($root, $snapshotId);
+    $dest = $base . '/data/' . $rel;
+    $mark = $base . '/created/' . $rel;
+    // First write wins: never clobber a path already captured in this snapshot,
+    // so a reused snapshot id can't overwrite the true pre-snapshot state.
+    if (is_file($dest) || is_file($mark)) return;
     if (is_file($target) && !is_link($target)) {
-        $dest = $base . '/data/' . $rel;
         if (@mkdir(dirname($dest), 0700, true) || is_dir(dirname($dest))) @copy($target, $dest);
     } else {
-        $mark = $base . '/created/' . $rel;
         if (@mkdir(dirname($mark), 0700, true) || is_dir(dirname($mark))) @touch($mark);
     }
 }
@@ -278,6 +281,10 @@ function backup_move_delete($root, $snapshotId, $rel, $target) {
     if (MAX_BACKUPS <= 0 || $snapshotId === '') return false;
     $base = snapshot_dir($root, $snapshotId);
     $dest = $base . '/data/' . $rel;
+    $mark = $base . '/created/' . $rel;
+    // First write wins: if this path was already captured in this snapshot, leave
+    // that capture intact and let the caller plain-unlink the current file.
+    if (is_file($dest) || is_file($mark)) return false;
     if (!@mkdir(dirname($dest), 0700, true) && !is_dir(dirname($dest))) return false;
     return @rename($target, $dest);
 }

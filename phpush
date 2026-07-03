@@ -448,7 +448,9 @@ if [ "$ROLLBACK" -eq 1 ]; then
 fi
 
 if [ "$NO_BACKUP" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    SNAPSHOT_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
+    snap_rand="$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+    [ -n "$snap_rand" ] || snap_rand="$$-$RANDOM$RANDOM"
+    SNAPSHOT_ID="$(date -u +%Y%m%d-%H%M%S)-$snap_rand"
 fi
 
 load_pushignore

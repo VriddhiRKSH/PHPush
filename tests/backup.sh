@@ -81,6 +81,16 @@ chk "backups never appear in the manifest" "$(curl -s "${hdr[@]}" "$BASE?action=
 chk "the mirror never deletes the backup dir" "$([ -d "$ROOT/.phpush-backups" ] && echo yes)" yes
 chk "backup dir carries an .htaccess deny"    "$([ -f "$ROOT/.phpush-backups/.htaccess" ] && echo yes)" yes
 
+echo "== a reused snapshot id cannot clobber an earlier backup (no data loss) =="
+b64u() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+pushs() { curl -s -o /dev/null "${hdr[@]}" -X POST -H "X-Deploy-Path: $(b64u "$1")" -H "X-Deploy-Mode: w" -H "X-Deploy-Final: 1" -H "X-Deploy-Offset: 0" -H "X-Deploy-Snapshot: $3" --data-binary "$2" "$BASE?action=push"; }
+printf 'ORIG\n' > "$ROOT/collide.txt"
+pushs collide.txt 'V1' fixedsnap
+pushs collide.txt 'V2' fixedsnap
+chk "server has the latest content" "$(sv collide.txt)" "V2"
+curl -s "${hdr[@]}" -X POST "$BASE?action=rollback&snapshot=fixedsnap" >/dev/null
+chk "rollback restored the TRUE original (no data loss)" "$(sv collide.txt)" "ORIG"
+
 echo "== --git rollback also restores the commit cursor =="
 cur() { curl -s "${hdr[@]}" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p'; }
 gsv() { cat "$ROOT/$1" 2>/dev/null || true; }
