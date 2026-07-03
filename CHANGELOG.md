@@ -4,6 +4,27 @@ All notable changes to PHPush are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-07-03
+
+### Added
+- **Server-side backups + `--rollback`.** Every deploy now snapshots the files it
+  is about to change: overwritten files are copied aside, deleted files are moved
+  into the snapshot, and newly-created files are recorded — so a snapshot is a
+  complete before-image of that deploy. `phpush --rollback` restores the latest
+  snapshot (or `phpush --rollback <id>` a specific one), undoing that deploy
+  exactly — overwritten/deleted files come back and files it added are removed —
+  with zero re-upload. `--rollback --dry-run` previews the counts; the pre-deploy
+  commit cursor is saved and restored so a `--git` rollback stays consistent.
+- **`--list-backups`** lists the server's snapshots (newest first).
+- **`--no-backup`** skips snapshotting a given deploy.
+- Snapshots live under a protected `.phpush-backups/` (rejected from push/delete,
+  hidden from the manifest, `.htaccess`-denied), bounded by the receiver's
+  `MAX_BACKUPS` (default 10, `0` disables backups entirely) with oldest-first
+  pruning by creation time.
+
+Client and receiver should be upgraded together; the client warns on a version
+mismatch (backups need the 0.6.0 receiver).
+
 ## [0.5.0] — 2026-07-03
 
 A correctness + hardening release acting on a full multi-lens review, plus two
@@ -147,6 +168,7 @@ push-to-deploy mirror: token-gated PHP receiver plus a bash client that diffs by
 content hash, uploads only changed files in chunks, verifies by sha1, and mirrors
 deletions.
 
+[0.6.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.6.0
 [0.5.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.5.0
 [0.4.1]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.1
 [0.4.0]: https://github.com/VriddhiRKSH/PHPush/releases/tag/v0.4.0

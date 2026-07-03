@@ -1,6 +1,6 @@
 <?php
 
-const PHPUSH_VERSION = '0.5.0';
+const PHPUSH_VERSION = '0.6.0';
 const DEPLOY_TOKEN = '__PASTE_64_HEX_TOKEN_HERE__';
 const ALLOW_IPS = [];
 const MAX_PUSH_BYTES = 0;
@@ -207,12 +207,18 @@ function read_snapshot_id() {
 function list_snapshots($root) {
     $dir = $root . '/' . BACKUP_DIR;
     if (!is_dir($dir)) return [];
-    $ids = [];
+    $items = [];
     foreach (@scandir($dir) ?: [] as $e) {
         if ($e === '.' || $e === '..') continue;
-        if (valid_snapshot_id($e) && is_dir($dir . '/' . $e)) $ids[] = $e;
+        if (valid_snapshot_id($e) && is_dir($dir . '/' . $e)) {
+            $items[] = [$e, (int) @filemtime($dir . '/' . $e)];
+        }
     }
-    sort($ids);
+    usort($items, function ($a, $b) {
+        return $a[1] === $b[1] ? strcmp($a[0], $b[0]) : ($a[1] <=> $b[1]);
+    });
+    $ids = [];
+    foreach ($items as $it) $ids[] = $it[0];
     return $ids;
 }
 
