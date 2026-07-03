@@ -177,6 +177,9 @@ releases. These exact interactions are pinned down in `tests/modes.sh`.
 | `-n`, `--dry-run` | Show what would upload/delete; change nothing. |
 | `--no-delete` | Upload changes but never delete server files. |
 | `--adopt` | Allow a **first** deploy to delete pre-existing files on a server PHPush has never deployed to (needed to take over an existing site — see below). |
+| `--no-backup` | Don't snapshot this deploy on the server (no rollback point for it). |
+| `--rollback [id]` | Undo the latest deploy (or snapshot `id`); with `--dry-run`, preview it. See [Rollback](#rollback-undo-a-bad-deploy). |
+| `--list-backups` | List the server's rollback snapshots (newest first). |
 | `--rehash` | Working-tree: ignore the server's hash cache. `--git`: force a full resync. |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
@@ -221,6 +224,34 @@ Matched files are neither uploaded nor deleted, in both modes. `.pushignore` and
 `.deploy_secret` are always excluded. (Supported globs are a practical subset:
 `*.log`, `dir/`, and `path/*.css` — not the full `.gitignore` grammar.)
 
+### Rollback (undo a bad deploy)
+
+Every deploy is snapshotted on the server first, so you can undo it with **zero
+re-upload**. Before a deploy overwrites or deletes anything, PHPush copies the
+old version into a protected `.phpush-backups/<snapshot>/`. If the deploy breaks
+the site:
+
+```console
+$ phpush --rollback --dry-run          # preview
+Rollback preview — snapshot 20260703-141502-8123
+Would restore 4 file(s) and remove 1 file(s).
+(dry run — nothing changed) — re-run without --dry-run to apply.
+
+$ phpush --rollback                     # apply
+Rolled back to snapshot 20260703-141502-8123: restored 4 file(s), removed 1 file(s).
+```
+
+A rollback is the exact inverse of the deploy: files it **overwrote or deleted**
+come back, and files it **added** are removed. Pick an older point with
+`phpush --rollback <id>` (`phpush --list-backups` lists them, newest first).
+
+- The server keeps the last **`MAX_BACKUPS`** snapshots (default 10; set
+  `MAX_BACKUPS = 0` in `phpush.php` to turn backups off entirely), pruning oldest
+  first. Each snapshot stores only the files that deploy changed, so it's small.
+- `--no-backup` skips snapshotting one deploy; `--dry-run` never snapshots.
+- After a `--git` rollback, the deploy commit marker is restored too — run your
+  next `--git` deploy with `--rehash` if you've since moved HEAD around.
+
 ## How it stays safe
 
 - **Token never leaks into logs or the process list.** It's sent only as a header
@@ -238,6 +269,11 @@ Matched files are neither uploaded nor deleted, in both modes. `.pushignore` and
 - **No accidental first-run wipe.** A version/status handshake lets the client
   detect a server it has never deployed to and refuse to delete pre-existing
   files without `--adopt` (see above).
+- **Reversible deploys.** Each deploy is snapshotted before it changes anything,
+  so a bad one is one `phpush --rollback` away. Snapshots sit in a protected
+  `.phpush-backups/` (denied via `.htaccess`, hidden from the manifest) — note
+  they hold old copies of your files, so treat that directory like the rest of
+  the deploy dir; see [SECURITY.md](SECURITY.md).
 
 Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 
@@ -268,8 +304,9 @@ tests/run.sh        # working-tree mode: security guards + full mirror
 tests/git.sh        # --git mode: cursor, incremental, add/delete/rename, resync
 tests/modes.sh      # mixing the two modes: uncommitted vs committed, drift, --rehash
 tests/security.sh   # hardening regressions: metadata privacy, path guards, no-wipe, exfil
+tests/backup.sh     # backups + rollback: exact undo, dry-run, pruning, protection
 ```
-Each spins up `php -S` locally and needs no network. CI runs all four (plus
+Each spins up `php -S` locally and needs no network. CI runs all five (plus
 `php -l` and `shellcheck`) on every push.
 
 ## Changelog & security
