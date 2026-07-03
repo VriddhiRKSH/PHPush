@@ -124,11 +124,19 @@ out="$( cd "$D" && DEPLOY_URL="http://127.0.0.1:$PORT/phpush.php" DEPLOY_TOKEN="
 printf '%s' "$out" | grep -qi 'must use https\|refusing' && bad "genuine localhost http wrongly refused" || ok "genuine http://127.0.0.1 still allowed"
 
 echo "== legacy state-file cleanup (v0.3 -> v0.4 upgrade) =="
-printf '{"old":"cache"}' > "$ROOT/.phpush-cache.json"
+printf '{"index.html":{"k":"11:1700000000","h":"2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"}}' > "$ROOT/.phpush-cache.json"
 printf '%040d' 1 > "$ROOT/.phpush-commit"
 curl -s "${hdr[@]}" "$BASE?action=manifest" >/dev/null
 chk "legacy .phpush-cache.json removed on run" "$([ -f "$ROOT/.phpush-cache.json" ] && echo present || echo gone)" gone
 chk "legacy .phpush-commit removed on run" "$([ -f "$ROOT/.phpush-commit" ] && echo present || echo gone)" gone
+
+echo "== legacy cleanup preserves USER files that merely share those names =="
+printf 'my important notes' > "$ROOT/.phpush-commit"
+printf '{"my":"data"}' > "$ROOT/.phpush-cache.json"
+curl -s "${hdr[@]}" "$BASE?action=manifest" >/dev/null
+chk "non-hex user .phpush-commit preserved" "$([ -f "$ROOT/.phpush-commit" ] && echo yes)" yes
+chk "non-legacy user .phpush-cache.json preserved" "$([ -f "$ROOT/.phpush-cache.json" ] && echo yes)" yes
+rm -f "$ROOT/.phpush-commit" "$ROOT/.phpush-cache.json"
 
 echo
 echo "passed: $pass   failed: $fail"

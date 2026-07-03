@@ -159,6 +159,29 @@ function prune_empty_dirs($dir, $root) {
     }
 }
 
+function looks_like_legacy_cache($raw) {
+    if (!is_string($raw) || $raw === '' || $raw[0] === '<') return false;
+    $d = json_decode($raw, true);
+    if (!is_array($d) || $d === []) return false;
+    foreach ($d as $v) {
+        if (!is_array($v) || !array_key_exists('k', $v) || !array_key_exists('h', $v)) return false;
+    }
+    return true;
+}
+
+function cleanup_legacy_state($root) {
+    $cacheLegacy  = $root . '/.phpush-cache.json';
+    $commitLegacy = $root . '/.phpush-commit';
+    if (is_file($root . '/' . CACHE_FILE) && is_file($cacheLegacy)
+        && looks_like_legacy_cache(@file_get_contents($cacheLegacy))) {
+        @unlink($cacheLegacy);
+    }
+    if (is_file($root . '/' . COMMIT_FILE) && is_file($commitLegacy)) {
+        $c = trim((string) @file_get_contents($commitLegacy));
+        if ($c !== '' && preg_match('/^[0-9a-f]{40,64}$/', $c)) @unlink($commitLegacy);
+    }
+}
+
 if (ALLOW_IPS && !in_array($_SERVER['REMOTE_ADDR'] ?? '', ALLOW_IPS, true)) {
     respond(403, ['ok' => false, 'error' => 'ip not allowed']);
 }
@@ -173,8 +196,7 @@ if ($token === '' || !hash_equals($configuredToken, $token)) {
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
 }
 
-@unlink($root . '/.phpush-cache.json');
-@unlink($root . '/.phpush-commit');
+cleanup_legacy_state($root);
 
 $action = $_GET['action'] ?? '';
 
