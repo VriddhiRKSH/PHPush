@@ -93,6 +93,11 @@ be audited.
   would delete pre-existing files on an unmanaged server unless you pass
   `--adopt` (or `--no-delete`), so pointing PHPush at a populated site can't
   silently mirror-delete it.
+- **Reversible deploys** — before overwriting or deleting anything, the receiver
+  snapshots the previous state into `.phpush-backups/<snapshot>/`, so a bad deploy
+  can be undone with `phpush --rollback` (see below for the disclosure caveat).
+  Restores are atomic (temp-then-rename) and confined to the deploy directory; the
+  backup area itself is rejected from push/delete and hidden from the manifest.
 - **Untrusted-repo safety (client)** — running `phpush` inside a hostile repo is
   guarded: it **refuses** a `.deploy_secret` that's been committed to the repo
   (yours should be gitignored), and it **skips symlinks** rather than following
@@ -115,6 +120,16 @@ be audited.
 - **Token strength is on you.** The receiver only checks the token is ≥ 32 chars
   and there is no rate-limiting, so a weak token (e.g. `aaaa…`) is guessable.
   Always generate it with `openssl rand -hex 32`.
+- **Backups hold old copies of your files.** Rollback snapshots under
+  `.phpush-backups/` contain previous versions of whatever you deployed — i.e.
+  content that was (or still is) on your public site. PHPush hardens the directory
+  with a dotfile name, an `.htaccess` deny, and a self-guarding `index.php`, but on
+  a host that ignores `.htaccess` (e.g. nginx) and serves dotfiles, a snapshotted
+  non-PHP file could be fetched by someone who guesses the path. This is old copies
+  of already-public files, not new secrets — but if that matters to you, deny
+  `.phpush-backups/` at the web-server level, or set `MAX_BACKUPS = 0` to disable
+  backups. (Never put real secrets in the deploy tree in the first place —
+  gitignore/`.pushignore` them.)
 
 ## Hardening checklist
 
@@ -125,4 +140,6 @@ be audited.
 - [ ] Restrict by IP if you can (`ALLOW_IPS`) — but not if you're behind a proxy/CDN.
 - [ ] Keep `.deploy_secret` gitignored and readable only by you (`chmod 600`).
 - [ ] Gitignore any secrets (`.env`, DB dumps) so the mirror can't publish them.
+- [ ] If your host ignores `.htaccess`, deny `.phpush-backups/` at the web-server
+      level (or set `MAX_BACKUPS = 0`) — it holds old copies of your files.
 - [ ] Remove `phpush.php` from the server when you're done deploying; re-upload to resume.
