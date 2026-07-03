@@ -286,9 +286,9 @@ if ($action === 'push') {
             respond(500, ['ok' => false, 'error' => 'finalize failed']);
         }
         @chmod($target, 0644);
-        respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $bytes, 'sha1' => sha1_file($target)]);
+        respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'sha1' => sha1_file($target)]);
     }
-    respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $bytes, 'partial' => true]);
+    respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'partial' => true]);
 }
 
 if ($action === 'delete') {
