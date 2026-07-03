@@ -111,6 +111,22 @@ rm empty.txt
 DEPLOY_CHUNK_BYTES=1024 "$CLIENT" --no-delete >/dev/null 2>&1
 chk "--no-delete keeps server file" "$([ -f "$ROOT/empty.txt" ] && echo kept || echo removed)" kept
 
+echo "== .pushignore excludes files from deploy (upload + delete) =="
+printf '*.log\nsecret/\nnotes.md\n' > .pushignore
+printf 'app log\n' > debug.log
+mkdir -p secret; printf 'k\n' > secret/key.txt
+printf 'n\n' > notes.md
+printf 'shipped\n' > shipped.html
+DEPLOY_CHUNK_BYTES=1024 "$CLIENT" >/dev/null 2>&1
+chk "ignored *.log not deployed"        "$([ -f "$ROOT/debug.log" ] && echo LEAKED || echo excluded)" excluded
+chk "ignored secret/ dir not deployed"  "$([ -f "$ROOT/secret/key.txt" ] && echo LEAKED || echo excluded)" excluded
+chk "ignored notes.md not deployed"     "$([ -f "$ROOT/notes.md" ] && echo LEAKED || echo excluded)" excluded
+chk ".pushignore itself not deployed"   "$([ -f "$ROOT/.pushignore" ] && echo LEAKED || echo excluded)" excluded
+chk "non-ignored file still deployed"   "$([ -f "$ROOT/shipped.html" ] && echo yes)" yes
+printf '*.log\nsecret/\nnotes.md\nshipped.html\n' > .pushignore
+DEPLOY_CHUNK_BYTES=1024 "$CLIENT" >/dev/null 2>&1
+chk "newly-ignored file left on server (not deleted)" "$([ -f "$ROOT/shipped.html" ] && echo kept || echo removed)" kept
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

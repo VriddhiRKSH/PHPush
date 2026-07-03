@@ -111,6 +111,17 @@ git commit -q -am "repoint symlink"
 deploy >/dev/null 2>&1
 chk "incremental: symlink still NOT deployed as a file" "$([ -e "$ROOT/link.html" ] && echo present || echo absent)" absent
 
+echo "== .pushignore excludes files in --git mode too =="
+printf '*.log\n' > .pushignore
+printf 'noise\n' > build.log
+printf 'ship\n' > release.txt
+git add .pushignore build.log release.txt
+git commit -q -m "add pushignore + files"
+deploy >/dev/null 2>&1
+chk "git: ignored build.log not deployed" "$([ -f "$ROOT/build.log" ] && echo LEAKED || echo excluded)" excluded
+chk "git: release.txt deployed"           "$(srv_sha release.txt)" "$(head_sha_of release.txt)"
+chk "git: .pushignore itself not deployed" "$([ -f "$ROOT/.pushignore" ] && echo LEAKED || echo excluded)" excluded
+
 echo "== delete-path parity: deleting a committed colon-named file is skipped, deploy still completes =="
 printf 'x\n' > 'weird:name.txt'
 git add 'weird:name.txt' >/dev/null 2>&1

@@ -197,12 +197,43 @@ bad_path() {
 }
 
 add_delete() {
+    pushignore_match "$1" && return 0
     case "$1" in
         *"$NL"*|*"$TAB"*|*"$CR"*|*:*)
             echo "warning: not deleting $(printf '%q' "$1") — its name has a ':' or control char, so PHPush could never have deployed it (nothing to remove)" >&2
             return 0 ;;
     esac
     DELETES+=("$1")
+}
+
+PUSHIGNORE_PATTERNS=()
+load_pushignore() {
+    local f="$REPO_ROOT/.pushignore" line
+    [ -f "$f" ] || return 0
+    [ -L "$f" ] && { echo "warning: .pushignore is a symlink — ignoring it" >&2; return 0; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        PUSHIGNORE_PATTERNS+=("$line")
+    done < "$f"
+}
+
+pushignore_match() {
+    [ "${#PUSHIGNORE_PATTERNS[@]}" -gt 0 ] || return 1
+    local rel="$1" p d base="${1##*/}"
+    # shellcheck disable=SC2254  # $p is intentionally a glob pattern here
+    for p in "${PUSHIGNORE_PATTERNS[@]}"; do
+        p="${p#/}"
+        case "$p" in
+            */)  d="${p%/}"; case "$rel" in "$d"|"$d"/*) return 0 ;; esac ;;
+            */*) case "$rel" in $p) return 0 ;; esac ;;
+            *)   case "$base" in $p) return 0 ;; esac
+                 case "$rel" in $p) return 0 ;; esac ;;
+        esac
+    done
+    return 1
 }
 
 push_chunk() {
@@ -319,6 +350,7 @@ plan_from_manifest() {
     DELETES=()
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
+        pushignore_match "$rel" && continue
         DELETES+=("$rel")
     done < <(LC_ALL=C comm -23 <(cut -f1 "$SERVER_PH" | LC_ALL=C sort -u) <(cut -f1 "$LOCAL_PH" | LC_ALL=C sort -u))
 }
@@ -326,8 +358,9 @@ plan_from_manifest() {
 add_local() {
     local rel="$1" src="$2" h
     case "$rel" in
-        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) return 0 ;;
+        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example|.pushignore|*/.pushignore) return 0 ;;
     esac
+    pushignore_match "$rel" && return 0
     [ -L "$src" ] && { echo "warning: skipping symlink (not deployed): $rel" >&2; return 0; }
     case "$rel" in *:*) echo "warning: skipping '$rel' — ':' is not allowed in deployed filenames (the server rejects it)" >&2; return 0 ;; esac
     bad_path "$rel" && return 0
@@ -350,6 +383,8 @@ if [ -n "$ver_resp" ]; then
         echo "note: server phpush.php is v$server_version but this client is v$VERSION — re-upload phpush.php to match" >&2
     fi
 fi
+
+load_pushignore
 
 HEAD=""
 LAST=""
@@ -393,6 +428,8 @@ if [ "$GIT_MODE" -eq 1 ]; then
                 160000) continue ;;
             esac
             rel="${entry#*$TAB}"
+            case "$rel" in .pushignore|*/.pushignore) continue ;; esac
+            pushignore_match "$rel" && continue
             reldir="$(dirname "$rel")"
             [ "$reldir" = "." ] || mkdir -p "$STAGING/$reldir"
             git show "$HEAD:$rel" > "$STAGING/$rel" 2>/dev/null || { echo "error: cannot read committed blob: $rel" >&2; exit 1; }
@@ -407,18 +444,21 @@ if [ "$GIT_MODE" -eq 1 ]; then
             case "$status" in
                 R*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
                     add_delete "$oldp"
+                    pushignore_match "$newp" && continue
                     if is_head_symlink "$newp"; then echo "warning: skipping symlink (not deployed): $newp" >&2; add_delete "$newp"; continue; fi
                     case "$newp" in *:*) echo "warning: skipping rename to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 C*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
+                    pushignore_match "$newp" && continue
                     if is_head_symlink "$newp"; then echo "warning: skipping symlink (not deployed): $newp" >&2; add_delete "$newp"; continue; fi
                     case "$newp" in *:*) echo "warning: skipping copy to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 D*) IFS= read -r -d '' p
                     add_delete "$p" ;;
                 *)  IFS= read -r -d '' p
                     case "$p" in
-                        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example) continue ;;
+                        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example|.pushignore|*/.pushignore) continue ;;
                         *:*) echo "warning: skipping '$p' — ':' is not allowed in deployed filenames" >&2; continue ;;
                     esac
+                    pushignore_match "$p" && continue
                     if is_head_symlink "$p"; then echo "warning: skipping symlink (not deployed): $p" >&2; add_delete "$p"; continue; fi
                     bad_path "$p" || UPLOADS+=("$p") ;;
             esac
