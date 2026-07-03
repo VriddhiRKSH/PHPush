@@ -1,11 +1,13 @@
 <?php
 
+const PHPUSH_VERSION = '0.5.0';
 const DEPLOY_TOKEN = '__PASTE_64_HEX_TOKEN_HERE__';
 const ALLOW_IPS = [];
 const MAX_PUSH_BYTES = 0;
 
 const CACHE_FILE = '.phpush-cache.php';
 const COMMIT_FILE = '.phpush-commit.php';
+const DEPLOYED_FILE = '.phpush-deployed.php';
 const TMP_SUFFIX = '.phpush-tmp';
 const STATE_GUARD = "<?php http_response_code(404); exit; ?>\n";
 
@@ -14,7 +16,7 @@ $realRoot = realpath($root);
 $realRoot = $realRoot === false ? $root : str_replace('\\', '/', $realRoot);
 
 $self = basename(__FILE__);
-$protectedLower = array_map('strtolower', [$self, CACHE_FILE, COMMIT_FILE]);
+$protectedLower = array_map('strtolower', [$self, CACHE_FILE, COMMIT_FILE, DEPLOYED_FILE]);
 
 $selfReal = realpath(__FILE__);
 $selfReal = $selfReal === false ? '' : strtolower(str_replace('\\', '/', $selfReal));
@@ -169,6 +171,11 @@ function looks_like_legacy_cache($raw) {
     return true;
 }
 
+function mark_deployed($root) {
+    $path = $root . '/' . DEPLOYED_FILE;
+    if (!is_file($path)) state_write($path, '1');
+}
+
 function cleanup_legacy_state($root) {
     $cacheLegacy  = $root . '/.phpush-cache.json';
     $commitLegacy = $root . '/.phpush-commit';
@@ -199,6 +206,14 @@ if ($token === '' || !hash_equals($configuredToken, $token)) {
 cleanup_legacy_state($root);
 
 $action = $_GET['action'] ?? '';
+
+if ($action === 'version') {
+    respond(200, [
+        'ok' => true,
+        'version' => PHPUSH_VERSION,
+        'managed' => is_file($root . '/' . DEPLOYED_FILE),
+    ]);
+}
 
 if ($action === 'manifest') {
     $cachePath = $root . '/' . CACHE_FILE;
@@ -293,6 +308,7 @@ if ($action === 'push') {
             respond(500, ['ok' => false, 'error' => 'finalize failed']);
         }
         @chmod($target, 0644);
+        mark_deployed($root);
         respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'sha1' => sha1_file($target)]);
     }
     respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'partial' => true]);
@@ -322,6 +338,7 @@ if ($action === 'delete') {
             }
         }
     }
+    if ($deleted) mark_deployed($root);
     respond(empty($errors) ? 200 : 207, ['ok' => empty($errors), 'deleted' => $deleted, 'errors' => $errors]);
 }
 

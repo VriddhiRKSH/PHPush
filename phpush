@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.4.1"
+VERSION="0.5.0"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$REPO_ROOT" ] || { echo "error: run phpush from inside the git project you want to deploy" >&2; exit 1; }
@@ -11,6 +11,7 @@ DRY_RUN=0
 NO_DELETE=0
 REHASH=0
 GIT_MODE=0
+ADOPT=0
 SECRET_FROM_FILE=0
 CHUNK_BYTES="${DEPLOY_CHUNK_BYTES:-1048576}"
 
@@ -20,7 +21,7 @@ phpush — mirror the current git project to a PHPush receiver over HTTPS.
 
 Usage:
   cd /path/to/your-project
-  phpush [--git] [--dry-run] [--no-delete] [--rehash]
+  phpush [--git] [--dry-run] [--no-delete] [--rehash] [--adopt]
 
 Modes:
   (default)        Mirror your WORKING TREE (tracked + untracked-not-ignored).
@@ -33,6 +34,8 @@ Options:
       --no-delete  Upload changes but never delete server files.
       --rehash     Working-tree mode: ignore the server's manifest cache.
                    --git mode: force a full resync (ignore the stored commit).
+      --adopt      Allow the first deploy to DELETE pre-existing files on a server
+                   PHPush has never deployed to (needed to take over an existing site).
   -h, --help       Show this help.
   -V, --version    Print version.
 
@@ -50,6 +53,7 @@ while [ $# -gt 0 ]; do
         -n|--dry-run) DRY_RUN=1 ;;
         --no-delete) NO_DELETE=1 ;;
         --rehash) REHASH=1 ;;
+        --adopt) ADOPT=1 ;;
         --git|--commit|--committed) GIT_MODE=1 ;;
         -h|--help) usage; exit 0 ;;
         -V|--version) echo "phpush $VERSION"; exit 0 ;;
@@ -334,6 +338,19 @@ add_local() {
     local_count=$((local_count + 1))
 }
 
+SERVER_MANAGED="unknown"
+ver_resp="$(curl -fsS -K "$CURLRC" --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=version" 2>/dev/null || true)"
+if [ -n "$ver_resp" ]; then
+    server_version="$(printf '%s' "$ver_resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+    case "$ver_resp" in
+        *'"managed":true'*)  SERVER_MANAGED=true ;;
+        *'"managed":false'*) SERVER_MANAGED=false ;;
+    esac
+    if [ -n "$server_version" ] && [ "$server_version" != "$VERSION" ]; then
+        echo "note: server phpush.php is v$server_version but this client is v$VERSION — re-upload phpush.php to match" >&2
+    fi
+fi
+
 HEAD=""
 LAST=""
 MODE_FULL=1
@@ -423,6 +440,14 @@ if [ "$NO_DELETE" -eq 1 ]; then
     DELETES=()
 fi
 delete_failures=0
+
+if [ "$SERVER_MANAGED" = false ] && [ "${#DELETES[@]}" -gt 0 ] && [ "$ADOPT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "error: the server has ${#DELETES[@]} file(s) PHPush has never deployed, and this run would DELETE them to mirror your project." >&2
+    echo "       To take over this directory (this WILL delete those files):  re-run with --adopt" >&2
+    echo "       To upload without deleting anything:                         re-run with --no-delete" >&2
+    echo "       To review exactly what would change first:                   phpush --dry-run" >&2
+    exit 1
+fi
 
 echo "Target : $DEPLOY_URL"
 if [ "$GIT_MODE" -eq 1 ]; then

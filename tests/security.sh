@@ -181,6 +181,25 @@ chk "non-hex user .phpush-commit preserved" "$([ -f "$ROOT/.phpush-commit" ] && 
 chk "non-legacy user .phpush-cache.json preserved" "$([ -f "$ROOT/.phpush-cache.json" ] && echo yes)" yes
 rm -f "$ROOT/.phpush-commit" "$ROOT/.phpush-cache.json"
 
+echo "== version handshake exposes version + managed state =="
+vout="$(curl -s "${hdr[@]}" "$BASE?action=version")"
+echo "$vout" | grep -q '"ok":true' && ok "version action responds ok" || bad "version action missing"
+echo "$vout" | grep -q '"version":"' && ok "reports a version string" || bad "no version field"
+echo "$vout" | grep -Eq '"managed":(true|false)' && ok "reports a managed flag" || bad "no managed field"
+
+echo "== first-deploy guard: refuses to wipe an unmanaged server unless --adopt =="
+rm -f "$ROOT/.phpush-deployed.php"
+printf 'existing site\n' > "$ROOT/legacy-index.html"
+D="$(newproj)"; ( cd "$D" && printf 'mine\n' > mine.html )
+out="$( cd "$D" && "$CLIENT" 2>&1 )"; rc=$?
+chk "refused first deploy that would delete foreign files" "$rc" 1
+echo "$out" | grep -qi 'adopt' && ok "guidance mentions --adopt" || bad "no --adopt guidance"
+chk "foreign file NOT deleted" "$([ -f "$ROOT/legacy-index.html" ] && echo yes)" yes
+( cd "$D" && "$CLIENT" --adopt >/dev/null 2>&1 ); rc2=$?
+chk "--adopt deploy exits 0" "$rc2" 0
+chk "--adopt deployed mine.html" "$([ -f "$ROOT/mine.html" ] && echo yes)" yes
+chk "--adopt removed the foreign file" "$([ -f "$ROOT/legacy-index.html" ] && echo present || echo gone)" gone
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]
