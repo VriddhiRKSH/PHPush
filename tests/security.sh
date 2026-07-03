@@ -95,6 +95,17 @@ chk "deploy did NOT fail over the colon file (exit 0)" "$rc" 0
 chk "the normal file was deployed" "$([ -f "$ROOT/good.txt" ] && echo yes)" yes
 chk "colon file not pushed to server" "$([ -f "$ROOT/a:b.txt" ] && echo LEAKED || echo skipped)" skipped
 
+echo "== self-protection is root-scoped: nested files sharing a reserved basename deploy =="
+chk "push PHPUSH.PHP at root still -> 400"      "$(PUSH 'PHPUSH.PHP' '<?php /*x*/')" 400
+chk "push root .phpush-cache.php still -> 400"  "$(PUSH '.phpush-cache.php' 'x')" 400
+chk "push nested libs/phpush.php -> 200"        "$(PUSH 'libs/phpush.php' '<?php /* real lib */')" 200
+chk "libs/phpush.php landed on server"          "$([ -f "$ROOT/libs/phpush.php" ] && echo yes)" yes
+chk "nested phpush.php appears in manifest"     "$(curl -s "${hdr[@]}" "$BASE?action=manifest" | grep -c 'libs/phpush.php')" 1
+chk "receiver itself still intact"              "$([ -f "$ROOT/phpush.php" ] && echo yes)" yes
+D="$(newproj)"; ( cd "$D" && mkdir -p vendor && printf '<?php\n' > vendor/phpush.php && printf 'hi\n' > index.html && "$CLIENT" >/dev/null 2>&1 ); rc=$?
+chk "client deploy with vendor/phpush.php exits 0" "$rc" 0
+chk "vendor/phpush.php mirrored"                "$([ -f "$ROOT/vendor/phpush.php" ] && echo yes)" yes
+
 echo "== token-leak guard: http exception matches the host exactly (no unanchored-glob bypass) =="
 D="$(newproj)"; ( cd "$D" && printf 'x\n' > f.txt )
 for badurl in \

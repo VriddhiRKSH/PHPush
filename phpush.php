@@ -88,9 +88,11 @@ function is_reserved_name($name) {
     return false;
 }
 
-function is_protected_target($target, array $protectedLower, $selfReal, $cacheReal, $commitReal) {
+function is_protected_target($target, $root, array $protectedLower, $selfReal, $cacheReal, $commitReal) {
     $bn = rtrim(strtolower(basename($target)), " .");
-    if (in_array($bn, $protectedLower, true)) return true;
+    $parent = rtrim(str_replace('\\', '/', dirname($target)), '/');
+    $rootNorm = rtrim(str_replace('\\', '/', $root), '/');
+    if ($parent === $rootNorm && in_array($bn, $protectedLower, true)) return true;
     if (is_reserved_name($target)) return true;
     $rt = realpath($target);
     if ($rt !== false) {
@@ -186,8 +188,8 @@ if ($action === 'manifest') {
     $newCache = [];
     $lines = [];
     foreach (list_files($root) as $rel) {
-        $bn = strtolower(basename($rel));
-        if (in_array($bn, $protectedLower, true) || is_reserved_name($rel)) continue;
+        $isRootProtected = (strpos($rel, '/') === false) && in_array(strtolower($rel), $protectedLower, true);
+        if ($isRootProtected || is_reserved_name($rel)) continue;
         $full = $root . '/' . $rel;
         $size = @filesize($full);
         $mtime = @filemtime($full);
@@ -212,7 +214,7 @@ if ($action === 'push') {
     }
     $rel = b64url_decode($_SERVER['HTTP_X_DEPLOY_PATH'] ?? '');
     $target = safe_target($root, $rel);
-    if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
+    if ($target === false || is_protected_target($target, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
         respond(400, ['ok' => false, 'error' => 'rejected path']);
     }
     $append = (($_SERVER['HTTP_X_DEPLOY_MODE'] ?? 'w') === 'a');
@@ -277,7 +279,7 @@ if ($action === 'delete') {
     if (is_array($list)) {
         foreach ($list as $rel) {
             $target = safe_target($root, $rel);
-            if ($target === false || is_protected_target($target, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
+            if ($target === false || is_protected_target($target, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) {
                 $errors[] = 'bad delete: ' . (is_string($rel) ? $rel : 'non-string');
                 continue;
             }
