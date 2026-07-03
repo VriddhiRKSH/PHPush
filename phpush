@@ -396,7 +396,11 @@ else
     plan_from_manifest
 fi
 
-[ "$NO_DELETE" -eq 1 ] && DELETES=()
+suppressed_deletes=0
+if [ "$NO_DELETE" -eq 1 ]; then
+    suppressed_deletes="${#DELETES[@]}"
+    DELETES=()
+fi
 delete_failures=0
 
 echo "Target : $DEPLOY_URL"
@@ -418,6 +422,11 @@ if [ "${#DELETES[@]}" -gt 0 ]; then
 fi
 
 if [ "${#UPLOADS[@]}" -eq 0 ] && [ "${#DELETES[@]}" -eq 0 ]; then
+    if [ "$GIT_MODE" -eq 1 ] && [ "$suppressed_deletes" -gt 0 ]; then
+        echo "note: --no-delete left $suppressed_deletes file(s) on the server that commit ${HEAD:0:10} removes;" >&2
+        echo "      the commit marker was NOT advanced (the server does not match this commit). Re-run without --no-delete to reconcile." >&2
+        exit 0
+    fi
     if [ "$GIT_MODE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && [ "$LAST" != "$HEAD" ]; then
         curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 60 \
             -H "Content-Type: text/plain" --data-binary "$HEAD" \
@@ -445,14 +454,16 @@ fi
 run_deletes || true
 
 if [ "$GIT_MODE" -eq 1 ]; then
-    if [ "$delete_failures" -eq 0 ]; then
+    if [ "$delete_failures" -eq 0 ] && [ "$suppressed_deletes" -eq 0 ]; then
         curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 60 \
             -H "Content-Type: text/plain" --data-binary "$HEAD" \
             "$DEPLOY_URL?action=commit" >/dev/null \
             || echo "WARNING: deploy succeeded but updating the commit marker failed — next run may re-send these files." >&2
         echo "Done. The server now matches commit ${HEAD:0:10}."
-    else
+    elif [ "$delete_failures" -ne 0 ]; then
         echo "WARNING: some deletes were rejected — the server does NOT match commit ${HEAD:0:10}; the commit marker was NOT advanced. Re-run to retry." >&2
+    else
+        echo "Done (uploads only). --no-delete left $suppressed_deletes file(s) that commit ${HEAD:0:10} removes; the commit marker was NOT advanced so a later run without --no-delete can reconcile." >&2
     fi
 else
     [ "$delete_failures" -eq 0 ] && echo "Done. The server now mirrors your working tree." \

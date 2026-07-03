@@ -71,6 +71,19 @@ chk "incremental --git keeps non-git extra.txt" "$(has extra.txt)" "PRESENT"
 run --git --rehash >/dev/null
 chk "full resync mirrors HEAD and removes extra.txt" "$(has extra.txt)" "ABSENT"
 
+echo "== --git --no-delete does not poison the commit cursor =="
+printf 'gone\n' > gone.txt; git add gone.txt; git commit -qm addgone
+run --git --rehash >/dev/null
+chk "gone.txt on server" "$(has gone.txt)" PRESENT
+cur_before="$(cur)"
+git rm -q gone.txt; git commit -qm rmgone; H_rm="$(git rev-parse HEAD)"
+run --git --no-delete >/dev/null
+chk "no-delete kept gone.txt on server" "$(has gone.txt)" PRESENT
+chk "cursor NOT advanced past the suppressed delete" "$(cur)" "$cur_before"
+run --git >/dev/null
+chk "later plain --git reconciles the delete" "$(has gone.txt)" ABSENT
+chk "cursor now advanced to the removal commit" "$(cur)" "$H_rm"
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]
