@@ -222,7 +222,7 @@ if ($action === 'manifest') {
             $hash = sha1_file($full);
             if ($hash === false) continue;
         }
-        $newCache[$rel] = ['k' => $key, 'h' => $hash];
+        if (preg_match('//u', $rel)) $newCache[$rel] = ['k' => $key, 'h' => $hash];
         $lines[] = $hash . "\t" . $rel;
     }
     $enc = json_encode($newCache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

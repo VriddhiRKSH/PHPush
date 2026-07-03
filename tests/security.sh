@@ -60,6 +60,18 @@ echo "== #5: MAX_PUSH_BYTES is cumulative across append chunks (cap=100) =="
 chk "chunk1 50B (w) -> 200" "$(PUSH 'big.bin' "$(head -c 50 /dev/zero | tr '\0' A)" w 0)" 200
 chk "chunk2 60B (a) exceeds cap -> 413" "$(PUSH 'big.bin' "$(head -c 60 /dev/zero | tr '\0' B)" a 1)" 413
 
+echo "== a non-UTF-8 filename does not void the whole manifest cache =="
+badname=$(printf 'bad_\xff_file.txt')
+if printf 'x' > "$ROOT/$badname" 2>/dev/null && [ -e "$ROOT/$badname" ]; then
+    printf 'ok\n' > "$ROOT/normal_utf8.txt"
+    curl -s "${hdr[@]}" "$BASE?action=manifest" >/dev/null
+    chk "cache file written despite non-utf8 name" "$([ -f "$ROOT/.phpush-cache.php" ] && echo yes)" yes
+    chk "valid file still cached (encode not voided)" "$(grep -c 'normal_utf8.txt' "$ROOT/.phpush-cache.php")" 1
+    rm -f "$ROOT/$badname" "$ROOT/normal_utf8.txt"
+else
+    ok "skipped: filesystem rejects non-UTF-8 names (cannot exercise here)"
+fi
+
 echo "== chunk offset guard: appending onto a stale/wrong-size temp is refused =="
 printf 'STALEDATA' > "$ROOT/foo.txt.phpush-tmp"
 off() { curl -s -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST -H "X-Deploy-Path: $(b64u "$1")" -H "X-Deploy-Mode: $2" -H "X-Deploy-Final: $3" -H "X-Deploy-Offset: $4" --data-binary "$5" "$BASE?action=push"; }
