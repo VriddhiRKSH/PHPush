@@ -33,6 +33,12 @@ cd "$PROJ" || exit 1
 git init -q .; git config user.email t@t; git config user.name t
 printf 'DEPLOY_URL="%s"\nDEPLOY_TOKEN="%s"\n' "$BASE" "$TOKEN" > .deploy_secret
 
+echo "== --list-backups on a fresh server says so plainly =="
+( cd "$PROJ" && "$CLIENT" --list-backups >/dev/null 2>&1 ); rc=$?
+chk "exits 0 with no snapshots" "$rc" 0
+out="$(run --list-backups)"
+echo "$out" | grep -qi 'No rollback snapshots' && ok "prints the empty-list message" || bad "empty list broken: $out"
+
 echo "== a deploy that overwrites/adds/deletes can be rolled back exactly =="
 printf 'A\n' > index.html; printf 'K\n' > keep.txt
 run >/dev/null
@@ -90,6 +96,65 @@ pushs collide.txt 'V2' fixedsnap
 chk "server has the latest content" "$(sv collide.txt)" "V2"
 curl -s "${hdr[@]}" -X POST "$BASE?action=rollback&snapshot=fixedsnap" >/dev/null
 chk "rollback restored the TRUE original (no data loss)" "$(sv collide.txt)" "ORIG"
+
+echo "== a deploy refuses to change files when the backup cannot be written =="
+prev="$(sv index.html)"
+printf 'G\n' > guard.txt
+run >/dev/null
+chmod 555 "$ROOT/.phpush-backups"
+sleep 1
+printf 'FL\n' > index.html
+out="$( cd "$PROJ" && "$CLIENT" 2>&1 )"; rc=$?
+chk "deploy aborted before uploading (exit 1)" "$rc" 1
+echo "$out" | grep -qi 'cannot write backup snapshots' && ok "preflight names the cause" || bad "no backup-failure message: $out"
+chk "server file untouched" "$(sv index.html)" "$prev"
+resp="$(curl -s "${hdr[@]}" -X POST -H "X-Deploy-Path: $(b64u index.html)" -H "X-Deploy-Mode: w" -H "X-Deploy-Final: 1" -H "X-Deploy-Offset: 0" -H "X-Deploy-Snapshot: failsnap1" --data-binary 'DIRECT-OVERWRITE' "$BASE?action=push")"
+echo "$resp" | grep -q 'backup failed' && ok "receiver hard-fails an overwrite it cannot back up" || bad "receiver did not refuse: $resp"
+chk "server file still untouched" "$(sv index.html)" "$prev"
+resp="$(curl -s "${hdr[@]}" -X POST -H 'Content-Type: application/json' -H 'X-Deploy-Snapshot: failsnap2' --data-binary '["guard.txt"]' "$BASE?action=delete")"
+echo "$resp" | grep -q 'backup failed — not deleted' && ok "receiver refuses a delete it cannot back up" || bad "delete not refused: $resp"
+chk "guarded file still present" "$(has guard.txt)" "PRESENT"
+chmod 755 "$ROOT/.phpush-backups"
+printf '%s\n' "$prev" > index.html
+rm guard.txt
+run >/dev/null
+
+echo "== rollback prints an undo id, and the undo restores the newer state =="
+sleep 1
+printf 'U2\n' > index.html
+run >/dev/null
+out="$(run --rollback)"
+echo "$out" | grep -q 'Undo this rollback' && ok "undo hint printed" || bad "no undo hint: $out"
+chk "rollback restored the older content" "$(sv index.html)" "$prev"
+undo="$(echo "$out" | sed -n 's/.*Undo this rollback:  phpush --rollback \([A-Za-z0-9._-]*\).*/\1/p' | head -1)"
+run --rollback "$undo" >/dev/null
+chk "undoing the rollback brings the newer content back" "$(sv index.html)" "U2"
+
+echo "== --rollback --no-backup leaves no undo handle =="
+sleep 1
+printf 'U3\n' > index.html
+run >/dev/null
+out="$(run --rollback --no-backup)"
+echo "$out" | grep -q 'Undo this rollback' && bad "unexpected undo hint with --no-backup" || ok "no undo hint with --no-backup"
+chk "the rollback itself still worked" "$(sv index.html)" "U2"
+printf 'U2\n' > index.html
+
+echo "== a half-failing rollback says PARTIAL and lists the file =="
+sleep 1
+printf 'U4\n' > index.html
+run >/dev/null
+rm -f "$ROOT/index.html"; mkdir "$ROOT/index.html"
+out="$( cd "$PROJ" && "$CLIENT" --rollback 2>&1 )"; rc=$?
+chk "partial rollback exits 1" "$rc" 1
+echo "$out" | grep -qi 'PARTIAL' && ok "says PARTIAL, not success" || bad "no PARTIAL marker: $out"
+echo "$out" | grep -q 'index.html' && ok "names the failed file" || bad "failed file not listed"
+snapid="$(echo "$out" | sed -n 's/.*rollback of snapshot \([A-Za-z0-9._-]*\).*/\1/p' | head -1)"
+curl -s "${hdr[@]}" "$BASE?action=backups" | grep -q "\"id\":\"$snapid\"" \
+    && ok "failed-rollback target snapshot survives for a retry" || bad "target snapshot was pruned away"
+chk "partial rollback cleared the commit marker (forces --git resync)" "$(cur2=$(curl -s "${hdr[@]}" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p'); echo "${cur2:-empty}")" "empty"
+rm -rf "$ROOT/index.html"
+run >/dev/null
+chk "reconciled after cleanup" "$(sv index.html)" "U4"
 
 echo "== --git rollback also restores the commit cursor =="
 cur() { curl -s "${hdr[@]}" "$BASE?action=commit" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p'; }

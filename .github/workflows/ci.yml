@@ -23,7 +23,7 @@ jobs:
         run: php -l phpush.php
 
       - name: ShellCheck client + tests
-        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh tests/modes.sh tests/security.sh tests/backup.sh
+        run: shellcheck --severity=warning phpush tests/run.sh tests/git.sh tests/modes.sh tests/security.sh tests/backup.sh tests/doctor.sh tests/target.sh tests/hashcache.sh
 
       - name: Integration tests (working-tree mode)
         run: bash tests/run.sh
@@ -39,3 +39,12 @@ jobs:
 
       - name: Integration tests (backups + rollback)
         run: bash tests/backup.sh
+
+      - name: Integration tests (doctor + handshake guards)
+        run: bash tests/doctor.sh
+
+      - name: Integration tests (named targets)
+        run: bash tests/target.sh
+
+      - name: Integration tests (batched hashing + local cache)
+        run: bash tests/hashcache.sh

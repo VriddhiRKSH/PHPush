@@ -108,8 +108,9 @@ chk "empty dir pruned on server" "$([ -d "$ROOT/css" ] && echo present || echo g
 
 printf 'keep-me\n' > index.html
 rm empty.txt
-DEPLOY_CHUNK_BYTES=1024 "$CLIENT" --no-delete >/dev/null 2>&1
+out="$(DEPLOY_CHUNK_BYTES=1024 "$CLIENT" --no-delete 2>&1)"
 chk "--no-delete keeps server file" "$([ -f "$ROOT/empty.txt" ] && echo kept || echo removed)" kept
+echo "$out" | grep -q "Done (uploads only)" && ok "--no-delete admits it did not mirror" || bad "--no-delete claimed a full mirror"
 
 echo "== .pushignore excludes files from deploy (upload + delete) =="
 printf '*.log\nsecret/\nnotes.md\n' > .pushignore
