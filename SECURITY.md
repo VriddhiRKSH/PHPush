@@ -92,12 +92,27 @@ be audited.
   PHPush has ever deployed to a directory. The client refuses a first deploy that
   would delete pre-existing files on an unmanaged server unless you pass
   `--adopt` (or `--no-delete`), so pointing PHPush at a populated site can't
-  silently mirror-delete it.
+  silently mirror-delete it. The guard **fails closed**: a handshake that cannot
+  be verified (unreachable server, non-PHPush reply, `--no-handshake`) also
+  counts as "not safe to delete", and an interactive deploy additionally lists
+  and confirms any deletes before sending.
+- **Serve-as-text token exposure is detected** — if the handshake reply contains
+  PHP source instead of JSON, the host is serving `phpush.php` as plain text and
+  the token inside it is public. The client hard-stops with rotate-the-token
+  instructions, and `phpush doctor` performs the same probe *without* a token
+  (plus checks that a token-less request gets a JSON 401) so the leak is caught
+  before any deploy. Doctor also verifies secret-file gitignore hygiene and
+  probes whether `.phpush-backups/` is fetchable from the web.
 - **Reversible deploys** — before overwriting or deleting anything, the receiver
   snapshots the previous state into `.phpush-backups/<snapshot>/`, so a bad deploy
   can be undone with `phpush --rollback` (see below for the disclosure caveat).
   Restores are atomic (temp-then-rename) and confined to the deploy directory; the
   backup area itself is rejected from push/delete and hidden from the manifest.
+  The net **fails loudly**: a file whose backup cannot be written (full disk, bad
+  permissions) is left untouched instead of being changed uncovered, deploys
+  preflight backup writability before uploading, a rollback that cannot restore
+  every file reports the exact failures instead of `ok`, and each rollback first
+  snapshots the state it replaces so it can itself be undone.
 - **Untrusted-repo safety (client)** — running `phpush` inside a hostile repo is
   guarded: it **refuses** a `.deploy_secret` that's been committed to the repo
   (yours should be gitignored), and it **skips symlinks** rather than following
@@ -128,11 +143,16 @@ be audited.
   non-PHP file could be fetched by someone who guesses the path. This is old copies
   of already-public files, not new secrets — but if that matters to you, deny
   `.phpush-backups/` at the web-server level, or set `MAX_BACKUPS = 0` to disable
-  backups. (Never put real secrets in the deploy tree in the first place —
-  gitignore/`.pushignore` them.)
+  backups. **`phpush doctor` probes exactly this** (it fetches a known harmless
+  file under `.phpush-backups/` without a token and flags a 200), so you don't
+  have to guess whether your host honors `.htaccess`. (Never put real secrets in
+  the deploy tree in the first place — gitignore/`.pushignore` them.)
 
 ## Hardening checklist
 
+- [ ] Run **`phpush doctor`** after setup and after host changes — it checks most
+      of this list automatically (PHP execution, token, versions, limits, backup
+      exposure) and marks problems with `!!`.
 - [ ] Generate a strong token: `openssl rand -hex 32` (not a guessable string).
 - [ ] Serve the receiver over **HTTPS** with a valid certificate.
 - [ ] Confirm the host executes `.php` and won't serve the source as text.

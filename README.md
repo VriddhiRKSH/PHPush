@@ -36,7 +36,7 @@ PHP*, and *preferring a single push command* to anything heavier.
 ```console
 $ phpush --dry-run
 Target : https://your-site.example/path/phpush.php
-Upload : 4   Delete: 0
+Upload : 4 (11.2 KB)   Delete: 0
 
 — to upload —
   + css/site.css
@@ -48,7 +48,7 @@ Upload : 4   Delete: 0
 
 $ phpush
 Target : https://your-site.example/path/phpush.php
-Upload : 4   Delete: 0
+Upload : 4 (11.2 KB)   Delete: 0
 ...
   uploaded 4/4 file(s)
 Done. The server now mirrors your working tree.
@@ -65,7 +65,7 @@ $ phpush --git
 Target : https://your-site.example/path/phpush.php
 Mode   : git (incremental) — commit 79885368da
 Since  : b21c334f18
-Upload : 2   Delete: 0
+Upload : 2 (3.1 KB)   Delete: 0
 
 — to upload —
   + app.js
@@ -111,6 +111,18 @@ Done. The server now matches commit 79885368da.
   ```
   (Copy `.deploy_secret.example` as a starting point. The file is **parsed, not
   executed** — only `DEPLOY_URL` and `DEPLOY_TOKEN` are read.)
+
+**3. Check it (once):**
+
+```sh
+phpush doctor
+```
+
+A read-only checkup of the whole chain: HTTPS, the host actually *running*
+`phpush.php` (and not serving its source — which would expose your token),
+the token being accepted, matching versions, host upload limits vs the chunk
+size, free disk, and whether the backup folder is readable from the web. Fix
+anything marked `!!` before your first real deploy.
 
 ## Install (make `phpush` a global command)
 
@@ -173,18 +185,46 @@ releases. These exact interactions are pinned down in `tests/modes.sh`.
 
 | Flag | Effect |
 |---|---|
+| `doctor` | Check the whole setup end to end — read-only, deploys nothing (see [Setup](#setup)). |
 | `--git` | Deploy the last commit instead of the working tree (aliases: `--commit`, `--committed`). |
 | `-n`, `--dry-run` | Show what would upload/delete; change nothing. |
 | `--no-delete` | Upload changes but never delete server files. |
+| `-y`, `--yes` | Skip the interactive "Delete N file(s)…?" confirmation (scripts/CI never see it anyway). |
+| `--target <name>` | Deploy to the site configured in `.deploy_secret.<name>` (see [Multiple sites](#multiple-sites-staging--production---target)). |
 | `--adopt` | Allow a **first** deploy to delete pre-existing files on a server PHPush has never deployed to (needed to take over an existing site — see below). |
-| `--no-backup` | Don't snapshot this deploy on the server (no rollback point for it). |
+| `--no-backup` | Don't snapshot this deploy on the server (no rollback point for it). With `--rollback`: don't snapshot the pre-rollback state (no undo). |
 | `--rollback [id]` | Undo the latest deploy (or snapshot `id`); with `--dry-run`, preview it. See [Rollback](#rollback-undo-a-bad-deploy). |
 | `--list-backups` | List the server's rollback snapshots (newest first). |
-| `--rehash` | Working-tree: ignore the server's hash cache. `--git`: force a full resync. |
+| `--rehash` | Working-tree: ignore the local and server hash caches. `--git`: force a full resync. |
+| `--no-handshake` | Skip the receiver identity check (only for hosts that block it); deletes then require `--adopt`. |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
 You can also override `DEPLOY_CHUNK_BYTES` (default `1048576`, i.e. 1 MB) if your
-host's `post_max_size` is unusually small or large.
+host's `post_max_size` is unusually small or large. It must be a plain number of
+**bytes** — `2097152`, not `2M` (the client refuses php.ini-style suffixes).
+
+### Multiple sites (staging + production): `--target`
+
+One project can deploy to more than one destination. Create one secret file per
+site — same format, named after the target:
+
+```sh
+.deploy_secret.staging      # DEPLOY_URL + DEPLOY_TOKEN for the staging site
+.deploy_secret.production   # DEPLOY_URL + DEPLOY_TOKEN for the live site
+```
+
+```sh
+phpush --target staging      # try it here first
+phpush --target production   # then ship it
+```
+
+Two safety behaviours are deliberate: once named target files exist, a bare
+`phpush` **refuses to guess** and lists the available names (deploying to the
+wrong site is exactly what this prevents), and the resolved target is shown on
+the `Target :` line and in the delete confirmation so you always see where the
+deploy is going. Each target keeps its own state on its own server (hash cache,
+commit cursor, backups), so nothing else changes. Gitignore the files with a
+single `.deploy_secret*` line (they are also never uploaded).
 
 ### Deploying to a site that already has files (`--adopt`)
 
@@ -239,12 +279,21 @@ Would restore 4 file(s) and remove 1 file(s).
 
 $ phpush --rollback                     # apply
 Rolled back to snapshot 20260703-141502-8123: restored 4 file(s), removed 1 file(s).
+Undo this rollback:  phpush --rollback 20260703-141610-rb1a2b3c4d
 ```
 
 A rollback is the exact inverse of the deploy: files it **overwrote or deleted**
 come back, and files it **added** are removed. Pick an older point with
 `phpush --rollback <id>` (`phpush --list-backups` lists them, newest first).
 
+- **A rollback can itself be undone.** Before applying one, the server snapshots
+  the current state and prints the undo command — so rolling back never throws
+  away work you can't get back (e.g. a hotfix made through the File Manager).
+  `--rollback --no-backup` skips that undo snapshot.
+- **The safety net fails loudly.** If the server can't write a backup (full disk,
+  bad permissions), a deploy refuses to overwrite or delete that file instead of
+  proceeding uncovered, and a rollback that can't restore every file reports
+  exactly which ones failed instead of claiming success.
 - The server keeps the last **`MAX_BACKUPS`** snapshots (default 10; set
   `MAX_BACKUPS = 0` in `phpush.php` to turn backups off entirely), pruning oldest
   first. Each snapshot stores only the files that deploy changed, so it's small.
@@ -268,12 +317,21 @@ come back, and files it **added** are removed. Pick an older point with
   files are chunked to stay under PHP upload limits.
 - **No accidental first-run wipe.** A version/status handshake lets the client
   detect a server it has never deployed to and refuse to delete pre-existing
-  files without `--adopt` (see above).
+  files without `--adopt` (see above). The handshake is a **hard stop**: if the
+  server is unreachable, answers like something other than a PHPush receiver,
+  rejects the token, or serves the PHP source as text (token exposure — rotate
+  it), the run aborts with a specific message instead of carrying on blind.
+- **Deletes are confirmed.** An interactive run that would delete server files
+  lists them and asks before sending anything (`--yes` skips the question;
+  scripts and CI are never prompted).
 - **Reversible deploys.** Each deploy is snapshotted before it changes anything,
-  so a bad one is one `phpush --rollback` away. Snapshots sit in a protected
-  `.phpush-backups/` (denied via `.htaccess`, hidden from the manifest) — note
-  they hold old copies of your files, so treat that directory like the rest of
-  the deploy dir; see [SECURITY.md](SECURITY.md).
+  so a bad one is one `phpush --rollback` away — and a rollback snapshots the
+  state it replaces, so it can be undone too. If a backup can't be written, the
+  file it covers is left untouched rather than changed uncovered. Snapshots sit
+  in a protected `.phpush-backups/` (denied via `.htaccess`, hidden from the
+  manifest) — note they hold old copies of your files, and `phpush doctor`
+  probes whether your host actually keeps them unreachable from the web; see
+  [SECURITY.md](SECURITY.md).
 
 Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
 
@@ -292,9 +350,12 @@ Full threat model and hardening checklist: **[SECURITY.md](SECURITY.md)**.
   (or `--no-delete`) — review `--dry-run` first.
 - Keep the client (`phpush`) and receiver (`phpush.php`) on the **same version**;
   the client prints a note if they differ. Re-upload `phpush.php` after upgrading.
-- The server caches file hashes by size+mtime, so repeat deploys don't re-hash
-  the whole tree. If you ever rewrite a file's contents without changing its size
-  or mtime, run once with `--rehash`.
+- Hashing is cached on **both** ends by size+mtime — the server keeps a manifest
+  cache, and the client keeps a local fingerprint cache in
+  `.git/phpush-hash-cache` and hashes in one batched process — so repeat deploys
+  and no-change runs are fast even on large trees. If you ever rewrite a file's
+  contents without changing its size or mtime, run once with `--rehash` (clears
+  both caches).
 - To pause deploys, delete `phpush.php` from the server; re-upload to resume.
 
 ## Tests
@@ -304,9 +365,12 @@ tests/run.sh        # working-tree mode: security guards + full mirror
 tests/git.sh        # --git mode: cursor, incremental, add/delete/rename, resync
 tests/modes.sh      # mixing the two modes: uncommitted vs committed, drift, --rehash
 tests/security.sh   # hardening regressions: metadata privacy, path guards, no-wipe, exfil
-tests/backup.sh     # backups + rollback: exact undo, dry-run, pruning, protection
+tests/backup.sh     # backups + rollback: exact undo, fail-loud, rollback-undo, pruning
+tests/doctor.sh     # doctor checks + the handshake hard-stops (--no-handshake, exposure)
+tests/target.sh     # named targets: refusal to guess, isolation, env conflicts
+tests/hashcache.sh  # batched hashing + local cache: awkward names, staleness, --rehash
 ```
-Each spins up `php -S` locally and needs no network. CI runs all five (plus
+Each spins up `php -S` locally and needs no network. CI runs all eight (plus
 `php -l` and `shellcheck`) on every push.
 
 ## Changelog & security

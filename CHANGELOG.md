@@ -4,6 +4,124 @@ All notable changes to PHPush are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-08-21
+
+A safety + speed release: the deploy path can no longer delete or overwrite
+anything silently, a new `phpush doctor` verifies the whole setup, one project
+can deploy to several sites, and re-deploys are dramatically faster. Client and
+receiver should be upgraded together.
+
+### Added
+- **`phpush doctor`** — a read-only, end-to-end checkup of a live setup: HTTPS,
+  the receiver actually *running* as PHP (a host that serves `phpush.php` as
+  plain text publishes the deploy token — doctor detects this from a token-less
+  probe and tells you to rotate), token acceptance, client/server version match,
+  secret-file gitignore hygiene, host limits (PHP version, `post_max_size` vs
+  chunk size, free disk) via a new `?action=status`, backup writability, and a
+  web-exposure probe of `.phpush-backups/` for hosts that ignore `.htaccess`.
+  Exits 0 when clean, 1 when problems are found.
+- **Named targets: `--target <name>`.** Reads `.deploy_secret.<name>` (same
+  parser, no new trust surface) so one project can deploy to staging and
+  production. When named target files exist, a bare `phpush` refuses to guess
+  and lists them; the resolved target is shown on the `Target :` line and in the
+  delete confirmation. `--target` combined with `DEPLOY_URL`/`DEPLOY_TOKEN` env
+  vars is refused rather than silently mixed.
+- **Delete confirmation.** When a deploy would delete server files and stdin is
+  an interactive terminal, the client now lists them and asks
+  `Delete N file(s) from the live site and proceed? [y/N]` before anything is
+  sent. `--yes`/`-y` skips the question; non-interactive runs (CI, cron) are
+  unchanged. The plan summary also shows the total upload size.
+- **Rollback can be undone.** Before applying a rollback the receiver snapshots
+  the current state through the same backup machinery and reports the new
+  snapshot id; the client prints `Undo this rollback: phpush --rollback <id>`.
+  `--rollback --no-backup` skips the undo snapshot.
+- **`?action=status`** (receiver): reports PHP version, `post_max_size` /
+  `upload_max_filesize` in bytes, free disk space, backup enablement +
+  writability, and the managed flag — powering doctor and the deploy preflight.
+- **`--no-handshake`** escape hatch for hosts that block the identity check;
+  deletes then require `--adopt`.
+
+### Changed
+- **The version handshake is now a hard stop.** Previously a failed or foreign
+  reply was silently ignored — which also switched off the first-deploy delete
+  guard. Now an unreachable server, a non-PHPush reply, PHP source served as
+  text, a rejected token, and an unconfigured token each abort the run with a
+  specific, actionable message before anything is uploaded or deleted.
+- **The first-deploy delete guard fails closed.** It now fires whenever the
+  server is not positively known to be PHPush-managed (previously only on an
+  explicit "never deployed" answer, so an unverifiable server bypassed it).
+- **~150× faster local hashing.** The client no longer starts one
+  `shasum`/`sha1sum` process per file: one batched `stat` pass fingerprints the
+  tree, a local size+mtime cache (`.git/phpush-hash-cache`) reuses hashes for
+  unchanged files, and only the misses are hashed in a single batched process.
+  Files modified in the same second as a cache write are always re-hashed, and
+  `--rehash` now clears the local cache as well as the server's.
+- **Deploys preflight the backup area.** A deploy that would snapshot aborts
+  before the first byte if the server cannot write backups, and warns when
+  chunks exceed the host's `post_max_size` (the classic mystery-413) or free
+  disk looks too small for the upload.
+- **Backups fail loudly (receiver).** Backup copy/mkdir results are no longer
+  discarded: a file whose backup cannot be written is *not* overwritten
+  (HTTP 500, file left untouched) and *not* deleted (reported per-file in the
+  delete response). Previously a full disk or bad permissions meant the "safety
+  net" silently didn't exist while the deploy went ahead.
+- **Rollback reports partial failure.** A rollback that cannot restore or
+  remove every file now answers HTTP 500 `partial rollback` with the exact
+  failed paths (and the undo id); previously it skipped failures silently and
+  answered `ok: true` with only counts.
+
+### Fixed (from the pre-release adversarial review)
+- **A malformed `DEPLOY_CHUNK_BYTES` (e.g. `2M`) no longer fakes a successful
+  deploy.** Previously a php.ini-style value crashed the upload loop mid-flight
+  in a way that skipped the failure accounting, printing "Done." and exiting 0
+  while zero bytes reached the server. The value is now validated up front
+  (whole number of bytes, > 0), and the final check counts uploads that actually
+  completed rather than trusting the failure counter.
+- **Upload errors now show the server's reason.** `push_chunk` no longer uses
+  `curl -f` (which discarded the response body), so a fail-loud backup refusal,
+  a 413, or any other server rejection prints the HTTP status and message
+  instead of a bare `FAILED: file`.
+- **`--list-backups` on a server with no snapshots** printed nothing and exited
+  1 (a `grep` pipeline under `set -o pipefail`); it now prints "No rollback
+  snapshots on the server yet." and exits 0.
+- **The delete confirmation prompts on the terminal** (`/dev/tty`), so a run
+  with stdout redirected to a log still shows the question instead of hanging
+  invisibly; with no terminal it fails closed (aborts).
+- **`--no-delete` no longer disarms the first-deploy guard.** Using the guard's
+  own suggested escape hatch marked the server as "managed", so the *next* plain
+  run could delete the pre-existing files without `--adopt`. Uploads from such a
+  run now tell the receiver not to mark the directory adopted.
+- **Rollback bookkeeping:** a rollback no longer evicts a real deploy snapshot
+  to make room for its own undo snapshot (the snapshot being restored and the
+  new undo are both protected from pruning, so a partial rollback can always be
+  retried); a rollback that applied nothing leaves no empty undo snapshot; and a
+  **partial** rollback clears the `--git` commit marker so the next `--git`
+  deploy does a full resync instead of reporting "Already in sync" over drifted
+  files.
+- **The server's manifest hash cache got the same same-second guard as the
+  client's** (generation stamp; entries whose mtime is within 2s are re-hashed),
+  closing a race where the server could report a hash for content it no longer
+  held. Old cache files are rebuilt once, harmlessly.
+- **`?action=status` reports `backups_on_disk`**, and doctor probes backup-folder
+  web exposure even when `MAX_BACKUPS = 0` but old snapshots remain on disk.
+- **All receiver responses now send `Cache-Control: no-store, private`** so an
+  intermediary cache can never replay manifest/status data to someone without
+  the token.
+- **`--git` full resync fails closed on case-insensitive disks** when two
+  committed paths collide on the local filesystem (previously one file's bytes
+  silently deployed under both names).
+- **Honest `--no-delete` reporting** in working-tree mode: "Done (uploads only)
+  … Re-run without --no-delete to reconcile" instead of claiming the server
+  mirrors the working tree.
+- **Backslash filenames no longer deploy to the wrong path.** The receiver
+  normalizes `\` to `/`, so a file literally named `back\slash.txt` was written
+  to a `back/` *subdirectory* on the server and the mirror never converged. The
+  client now skips `\` names with a warning (like `:` names) and refuses to
+  send deletes for them.
+- **`.deploy_secret.*` files are excluded everywhere.** The secret exclusion now
+  covers named-target files in both modes, including the `--git` incremental
+  rename/copy paths, which previously did not check secret names at all.
+
 ## [0.6.0] — 2026-07-03
 
 ### Added
