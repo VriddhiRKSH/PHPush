@@ -1,6 +1,6 @@
 <?php
 
-const PHPUSH_VERSION = '0.6.0';
+const PHPUSH_VERSION = '0.7.0';
 const DEPLOY_TOKEN = '__PASTE_64_HEX_TOKEN_HERE__';
 const ALLOW_IPS = [];
 const MAX_PUSH_BYTES = 0;
@@ -36,6 +36,8 @@ function resolve_token() {
 function respond($code, array $payload) {
     http_response_code($code);
     header('Content-Type: application/json');
+    header('Cache-Control: no-store, private');
+    header('Vary: X-Deploy-Token');
     header('X-Content-Type-Options: nosniff');
     header('X-Robots-Tag: noindex, nofollow');
     echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -45,6 +47,8 @@ function respond($code, array $payload) {
 function respond_text($code, $body) {
     http_response_code($code);
     header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store, private');
+    header('Vary: X-Deploy-Token');
     header('X-Content-Type-Options: nosniff');
     header('X-Robots-Tag: noindex, nofollow');
     echo $body;
@@ -232,61 +236,92 @@ function rrmdir($dir) {
     @rmdir($dir);
 }
 
-function prune_snapshots($root) {
+function prune_snapshots($root, array $keep = []) {
     if (MAX_BACKUPS <= 0) return;
     $dir = $root . '/' . BACKUP_DIR;
     $ids = list_snapshots($root);
-    for ($i = 0, $n = count($ids) - MAX_BACKUPS; $i < $n; $i++) {
-        rrmdir($dir . '/' . $ids[$i]);
+    $excess = count($ids) - MAX_BACKUPS;
+    foreach ($ids as $sid) {
+        if ($excess <= 0) break;
+        if (in_array($sid, $keep, true)) continue;
+        rrmdir($dir . '/' . $sid);
+        $excess--;
     }
 }
 
-function snapshot_dir($root, $snapshotId) {
+function ensure_backups_root($root) {
     $backupsRoot = $root . '/' . BACKUP_DIR;
-    $base = $backupsRoot . '/' . $snapshotId;
-    if (is_dir($base)) return $base;
     if (!is_dir($backupsRoot)) {
         @mkdir($backupsRoot, 0700, true);
         @file_put_contents($backupsRoot . '/.htaccess', "Require all denied\nDeny from all\n");
         @file_put_contents($backupsRoot . '/index.php', STATE_GUARD);
     }
+    return is_dir($backupsRoot) && is_writable($backupsRoot) ? $backupsRoot : false;
+}
+
+function snapshot_dir($root, $snapshotId, $prune = true) {
+    $backupsRoot = $root . '/' . BACKUP_DIR;
+    $base = $backupsRoot . '/' . $snapshotId;
+    if (is_dir($base)) return is_writable($base) ? $base : false;
+    if (ensure_backups_root($root) === false) return false;
     @mkdir($base, 0700, true);
+    if (!is_dir($base) || !is_writable($base)) return false;
     $commitSrc = $root . '/' . COMMIT_FILE;
     if (is_file($commitSrc)) @copy($commitSrc, $base . '/commit.php');
-    prune_snapshots($root);
+    if ($prune) prune_snapshots($root);
     return $base;
 }
 
 // Called at push finalize: preserve whatever is currently at $target before it is
 // replaced. If nothing is there, record that this deploy created the file so a
-// rollback removes it.
-function backup_before_overwrite($root, $snapshotId, $rel, $target) {
-    if (MAX_BACKUPS <= 0 || $snapshotId === '') return;
-    $base = snapshot_dir($root, $snapshotId);
+// rollback removes it. Returns true when the state is captured (or no snapshot
+// was requested), false when a required backup could not be written — callers
+// must then leave the target untouched.
+function backup_before_overwrite($root, $snapshotId, $rel, $target, $prune = true) {
+    if (MAX_BACKUPS <= 0 || $snapshotId === '') return true;
+    $base = snapshot_dir($root, $snapshotId, $prune);
+    if ($base === false) return false;
     $dest = $base . '/data/' . $rel;
     $mark = $base . '/created/' . $rel;
     // First write wins: never clobber a path already captured in this snapshot,
     // so a reused snapshot id can't overwrite the true pre-snapshot state.
-    if (is_file($dest) || is_file($mark)) return;
+    if (is_file($dest) || is_file($mark)) return true;
     if (is_file($target) && !is_link($target)) {
-        if (@mkdir(dirname($dest), 0700, true) || is_dir(dirname($dest))) @copy($target, $dest);
-    } else {
-        if (@mkdir(dirname($mark), 0700, true) || is_dir(dirname($mark))) @touch($mark);
+        if (!@mkdir(dirname($dest), 0700, true) && !is_dir(dirname($dest))) return false;
+        return (bool) @copy($target, $dest);
     }
+    if (!@mkdir(dirname($mark), 0700, true) && !is_dir(dirname($mark))) return false;
+    return (bool) @touch($mark);
 }
 
 // Called at delete: move the file into the snapshot instead of unlinking it, so
-// the delete itself is the backup. Returns true if the file was moved away.
-function backup_move_delete($root, $snapshotId, $rel, $target) {
-    if (MAX_BACKUPS <= 0 || $snapshotId === '') return false;
-    $base = snapshot_dir($root, $snapshotId);
+// the delete itself is the backup. Returns 'moved' when the file went into the
+// snapshot, 'skip' when no backup is needed (backups off, or this path already
+// captured — caller may plain-unlink), or 'fail' when a required backup could
+// not be written — callers must then leave the target in place.
+function backup_move_delete($root, $snapshotId, $rel, $target, $prune = true) {
+    if (MAX_BACKUPS <= 0 || $snapshotId === '') return 'skip';
+    $base = snapshot_dir($root, $snapshotId, $prune);
+    if ($base === false) return 'fail';
     $dest = $base . '/data/' . $rel;
     $mark = $base . '/created/' . $rel;
     // First write wins: if this path was already captured in this snapshot, leave
     // that capture intact and let the caller plain-unlink the current file.
-    if (is_file($dest) || is_file($mark)) return false;
-    if (!@mkdir(dirname($dest), 0700, true) && !is_dir(dirname($dest))) return false;
-    return @rename($target, $dest);
+    if (is_file($dest) || is_file($mark)) return 'skip';
+    if (!@mkdir(dirname($dest), 0700, true) && !is_dir(dirname($dest))) return 'fail';
+    return @rename($target, $dest) ? 'moved' : 'fail';
+}
+
+function ini_bytes($value) {
+    $value = trim((string) $value);
+    if ($value === '') return -1;
+    $n = (float) $value;
+    switch (strtolower(substr($value, -1))) {
+        case 'g': return (int) ($n * 1073741824);
+        case 'm': return (int) ($n * 1048576);
+        case 'k': return (int) ($n * 1024);
+        default:  return (int) $n;
+    }
 }
 
 function collect_rel_files($dir) {
@@ -330,13 +365,47 @@ if ($action === 'version') {
     ]);
 }
 
+if ($action === 'status') {
+    $backupsPresent = is_dir($root . '/' . BACKUP_DIR);
+    $backupsWritable = null;
+    if (MAX_BACKUPS > 0 || $backupsPresent) {
+        $backupsRoot = ensure_backups_root($root);
+        $probeOk = false;
+        if ($backupsRoot !== false) {
+            @file_put_contents($backupsRoot . '/probe.html', "phpush-probe\n");
+            $probeOk = (@file_get_contents($backupsRoot . '/probe.html') === "phpush-probe\n");
+        }
+        if (MAX_BACKUPS > 0) $backupsWritable = ($backupsRoot !== false && $probeOk);
+    }
+    $free = function_exists('disk_free_space') ? @disk_free_space($root) : false;
+    respond(200, [
+        'ok' => true,
+        'version' => PHPUSH_VERSION,
+        'php' => PHP_VERSION,
+        'managed' => is_file($root . '/' . DEPLOYED_FILE),
+        'writable_root' => is_writable($root),
+        'post_max_bytes' => ini_bytes(ini_get('post_max_size')),
+        'upload_max_bytes' => ini_bytes(ini_get('upload_max_filesize')),
+        'memory_limit' => (string) ini_get('memory_limit'),
+        'disk_free_bytes' => $free === false ? -1 : (int) $free,
+        'max_backups' => MAX_BACKUPS,
+        'backups_on_disk' => $backupsPresent ? count(list_snapshots($root)) : 0,
+        'backups_writable' => $backupsWritable,
+    ]);
+}
+
 if ($action === 'manifest') {
     $cachePath = $root . '/' . CACHE_FILE;
     $cache = [];
+    $gen = 0;
     if (empty($_GET['fresh'])) {
         $decoded = json_decode(state_read($cachePath), true);
-        if (is_array($decoded)) $cache = $decoded;
+        if (is_array($decoded) && isset($decoded['gen'], $decoded['files']) && is_array($decoded['files'])) {
+            $gen = (int) $decoded['gen'];
+            $cache = $decoded['files'];
+        }
     }
+    $now = time();
     $newCache = [];
     $lines = [];
     foreach (list_files($root) as $rel) {
@@ -346,7 +415,8 @@ if ($action === 'manifest') {
         $size = @filesize($full);
         $mtime = @filemtime($full);
         $key = $size . ':' . $mtime;
-        if (isset($cache[$rel]['k'], $cache[$rel]['h']) && $cache[$rel]['k'] === $key) {
+        if ($mtime !== false && ((int) $mtime + 2) <= $gen
+            && isset($cache[$rel]['k'], $cache[$rel]['h']) && $cache[$rel]['k'] === $key) {
             $hash = $cache[$rel]['h'];
         } else {
             $hash = sha1_file($full);
@@ -355,7 +425,7 @@ if ($action === 'manifest') {
         if (preg_match('//u', $rel)) $newCache[$rel] = ['k' => $key, 'h' => $hash];
         $lines[] = $hash . "\t" . $rel;
     }
-    $enc = json_encode($newCache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $enc = json_encode(['gen' => $now, 'files' => $newCache], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if ($enc !== false) state_write($cachePath, $enc);
     respond_text(200, $lines ? implode("\n", $lines) . "\n" : '');
 }
@@ -418,14 +488,22 @@ if ($action === 'push') {
         respond($tooBig ? 413 : 500, ['ok' => false, 'error' => $tooBig ? 'too large' : 'write failed']);
     }
     if ($final) {
-        backup_before_overwrite($root, read_snapshot_id(), $rel, $target);
+        $snapshotId = read_snapshot_id();
+        if (!backup_before_overwrite($root, $snapshotId, $rel, $target)) {
+            @unlink($tmp);
+            respond(500, ['ok' => false, 'error' => 'backup failed (' . BACKUP_DIR . ' not writable, or disk full) — file left untouched']);
+        }
         if (!@rename($tmp, $target)) {
             @unlink($tmp);
             respond(500, ['ok' => false, 'error' => 'finalize failed']);
         }
         @chmod($target, 0644);
-        mark_deployed($root);
-        respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'sha1' => sha1_file($target)]);
+        if (($_SERVER['HTTP_X_DEPLOY_NO_ADOPT'] ?? '') !== '1') mark_deployed($root);
+        respond(200, [
+            'ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes,
+            'sha1' => sha1_file($target),
+            'backed_up' => (MAX_BACKUPS > 0 && $snapshotId !== ''),
+        ]);
     }
     respond(200, ['ok' => true, 'path' => $rel, 'bytes' => $existing + $bytes, 'partial' => true]);
 }
@@ -452,12 +530,19 @@ if ($action === 'delete') {
             if (is_file($target) || is_link($target)) {
                 $removed = false;
                 if (is_file($target) && !is_link($target)) {
-                    $removed = backup_move_delete($root, $snapshotId, $rel, $target);
+                    $bk = backup_move_delete($root, $snapshotId, $rel, $target);
+                    if ($bk === 'fail') {
+                        $errors[] = 'backup failed — not deleted: ' . $rel;
+                        continue;
+                    }
+                    $removed = ($bk === 'moved');
                 }
                 if (!$removed) $removed = @unlink($target);
                 if ($removed) {
                     $deleted[] = $rel;
                     prune_empty_dirs(dirname($target), $root);
+                } else {
+                    $errors[] = 'delete failed: ' . $rel;
                 }
             }
         }
@@ -520,33 +605,69 @@ if ($action === 'rollback') {
             'restore' => $restore, 'remove' => $remove,
         ]);
     }
+    $undoId = '';
+    if (MAX_BACKUPS > 0 && empty($_GET['nosnap']) && (count($restore) + count($remove)) > 0) {
+        $undoId = gmdate('Ymd-His') . '-rb' . bin2hex(random_bytes(4));
+        if (snapshot_dir($root, $undoId, false) === false) {
+            respond(500, ['ok' => false, 'error' => 'cannot snapshot the current state before rolling back (' . BACKUP_DIR . ' not writable, or disk full) — nothing changed']);
+        }
+    }
     $restored = 0;
+    $failed = [];
     foreach ($restore as $rel) {
         $dst = safe_target($root, $rel);
-        if ($dst === false || is_protected_target($dst, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) continue;
+        if ($dst === false || is_protected_target($dst, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) { $failed[] = $rel; continue; }
         $dir = dirname($dst);
-        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) continue;
-        if (confined_dir($dir, $realRoot) === false || is_link($dst)) continue;
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) { $failed[] = $rel; continue; }
+        if (confined_dir($dir, $realRoot) === false || is_link($dst)) { $failed[] = $rel; continue; }
+        if ($undoId !== '' && !backup_before_overwrite($root, $undoId, $rel, $dst, false)) { $failed[] = $rel; continue; }
         $tmp = $dst . TMP_SUFFIX;
         if (@copy($base . '/data/' . $rel, $tmp) && @rename($tmp, $dst)) {
             @chmod($dst, 0644);
             $restored++;
         } else {
             @unlink($tmp);
+            $failed[] = $rel;
         }
     }
     $removed = 0;
     foreach ($remove as $rel) {
         $dst = safe_target($root, $rel);
-        if ($dst === false || is_protected_target($dst, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) continue;
-        if (confined_dir(dirname($dst), $realRoot) === false) continue;
-        if ((is_file($dst) || is_link($dst)) && @unlink($dst)) {
+        if ($dst === false || is_protected_target($dst, $root, $protectedLower, $selfReal, $cacheReal, $commitReal)) { $failed[] = $rel; continue; }
+        if (confined_dir(dirname($dst), $realRoot) === false) { $failed[] = $rel; continue; }
+        if (!is_file($dst) && !is_link($dst)) continue;
+        $gone = false;
+        if ($undoId !== '' && is_file($dst) && !is_link($dst)) {
+            $bk = backup_move_delete($root, $undoId, $rel, $dst, false);
+            if ($bk === 'fail') { $failed[] = $rel; continue; }
+            $gone = ($bk === 'moved');
+        }
+        if (!$gone) $gone = @unlink($dst);
+        if ($gone) {
             $removed++;
             prune_empty_dirs(dirname($dst), $root);
+        } else {
+            $failed[] = $rel;
         }
     }
-    if (is_file($base . '/commit.php')) @copy($base . '/commit.php', $root . '/' . COMMIT_FILE);
-    respond(200, ['ok' => true, 'snapshot' => $id, 'restored' => $restored, 'removed' => $removed]);
+    if ($undoId !== '' && $restored === 0 && $removed === 0) {
+        rrmdir($root . '/' . BACKUP_DIR . '/' . $undoId);
+        $undoId = '';
+    }
+    if ($failed) {
+        state_write($root . '/' . COMMIT_FILE, '');
+    } elseif (($restored + $removed) > 0 && is_file($base . '/commit.php')) {
+        @copy($base . '/commit.php', $root . '/' . COMMIT_FILE);
+    }
+    if ($undoId !== '') prune_snapshots($root, [$id, $undoId]);
+    if ($failed) {
+        respond(500, [
+            'ok' => false, 'error' => 'partial rollback', 'snapshot' => $id,
+            'restored' => $restored, 'removed' => $removed,
+            'failed' => $failed, 'undo' => $undoId,
+        ]);
+    }
+    respond(200, ['ok' => true, 'snapshot' => $id, 'restored' => $restored, 'removed' => $removed, 'undo' => $undoId]);
 }
 
 respond(400, ['ok' => false, 'error' => 'unknown action']);
