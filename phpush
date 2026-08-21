@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$REPO_ROOT" ] || { echo "error: run phpush from inside the git project you want to deploy" >&2; exit 1; }
@@ -18,7 +18,19 @@ ROLLBACK_ID=""
 LIST_BACKUPS=0
 SNAPSHOT_ID=""
 SECRET_FROM_FILE=0
+ASSUME_YES=0
+NO_HANDSHAKE=0
+DOCTOR=0
+ADOPT_BLOCK=0
+TARGET_NAME=""
 CHUNK_BYTES="${DEPLOY_CHUNK_BYTES:-1048576}"
+case "$CHUNK_BYTES" in
+    ''|*[!0-9]*)
+        echo "error: DEPLOY_CHUNK_BYTES must be a whole number of BYTES, got: $CHUNK_BYTES" >&2
+        echo "       php.ini-style suffixes are not accepted — use 2097152, not 2M." >&2
+        exit 1 ;;
+esac
+[ "$CHUNK_BYTES" -gt 0 ] || { echo "error: DEPLOY_CHUNK_BYTES must be greater than 0" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
@@ -27,6 +39,8 @@ phpush — mirror the current git project to a PHPush receiver over HTTPS.
 Usage:
   cd /path/to/your-project
   phpush [--git] [--dry-run] [--no-delete] [--rehash] [--adopt] [--no-backup]
+         [--yes] [--target <name>]
+  phpush doctor [--target <name>]
   phpush --list-backups
   phpush --rollback [<snapshot-id>] [--dry-run]
 
@@ -35,20 +49,29 @@ Modes:
   --git            Mirror your last COMMIT instead (ignores uncommitted changes).
                    The server remembers the last commit it received and only the
                    files changed since then are sent. Aliases: --commit, --committed.
+  doctor           Check the whole setup end to end (HTTPS, token, PHP execution,
+                   host limits, backup protection). Read-only; deploys nothing.
 
 Options:
   -n, --dry-run    Show what would be uploaded/deleted, change nothing.
                    With --rollback, preview what a rollback would restore/remove.
       --no-delete  Upload changes but never delete server files.
-      --rehash     Working-tree mode: ignore the server's manifest cache.
+      --rehash     Working-tree mode: ignore the local and server hash caches.
                    --git mode: force a full resync (ignore the stored commit).
       --adopt      Allow the first deploy to DELETE pre-existing files on a server
                    PHPush has never deployed to (needed to take over an existing site).
       --no-backup  Do not snapshot this deploy on the server (no rollback point).
+                   With --rollback: do not snapshot the pre-rollback state (no undo).
+  -y, --yes        Do not ask before deleting server files (interactive runs ask).
+      --target <name>  Deploy to the target configured in .deploy_secret.<name>
+                       instead of .deploy_secret (e.g. --target staging).
+      --no-handshake   Skip the receiver identity check (only for hosts that block
+                       it). Deletes then require --adopt.
       --list-backups   List the server's rollback snapshots (newest first).
       --rollback [id]  Restore the latest snapshot (or the given one), undoing that
                        deploy: overwritten/deleted files come back, files it added
-                       are removed. Preview with --dry-run first.
+                       are removed. Preview with --dry-run first. The pre-rollback
+                       state is snapshotted too, so a rollback can itself be undone.
   -h, --help       Show this help.
   -V, --version    Print version.
 
@@ -68,6 +91,14 @@ while [ $# -gt 0 ]; do
         --rehash) REHASH=1 ;;
         --adopt) ADOPT=1 ;;
         --no-backup) NO_BACKUP=1 ;;
+        -y|--yes) ASSUME_YES=1 ;;
+        --no-handshake) NO_HANDSHAKE=1 ;;
+        doctor) DOCTOR=1 ;;
+        --target)
+            TARGET_NAME="${2:-}"
+            [ -n "$TARGET_NAME" ] || { echo "error: --target needs a name (e.g. --target staging)" >&2; exit 2; }
+            shift ;;
+        --target=*) TARGET_NAME="${1#--target=}" ;;
         --list-backups) LIST_BACKUPS=1 ;;
         --rollback)
             ROLLBACK=1
@@ -80,24 +111,73 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ -n "$TARGET_NAME" ]; then
+    case "$TARGET_NAME" in
+        *[!A-Za-z0-9._-]*)
+            echo "error: invalid target name '$TARGET_NAME' (use letters, digits, . _ -)" >&2; exit 2 ;;
+        example)
+            echo "error: 'example' is not a deployable target (.deploy_secret.example is the template)" >&2; exit 2 ;;
+    esac
+fi
+
+list_named_targets() {
+    local f bn
+    for f in "$REPO_ROOT"/.deploy_secret.*; do
+        [ -e "$f" ] || continue
+        bn="${f##*/}"
+        bn="${bn#.deploy_secret.}"
+        [ "$bn" = "example" ] && continue
+        printf '%s ' "$bn"
+    done
+}
+
+if [ -n "$TARGET_NAME" ]; then
+    if [ -n "${DEPLOY_URL:-}" ] || [ -n "${DEPLOY_TOKEN:-}" ]; then
+        echo "error: --target and the DEPLOY_URL/DEPLOY_TOKEN environment variables are both set — unset the env vars so the target file is the only source" >&2
+        exit 1
+    fi
+    SECRET_FILE="$REPO_ROOT/.deploy_secret.$TARGET_NAME"
+    if [ ! -f "$SECRET_FILE" ]; then
+        known="$(list_named_targets)"
+        echo "error: no .deploy_secret.$TARGET_NAME for target '$TARGET_NAME'${known:+ (available: ${known% })}" >&2
+        exit 1
+    fi
+elif [ -z "${DEPLOY_URL:-}" ] || [ -z "${DEPLOY_TOKEN:-}" ]; then
+    known="$(list_named_targets)"
+    if [ -n "$known" ]; then
+        echo "error: this project has named deploy targets: ${known% }" >&2
+        echo "       Pick one explicitly:  phpush --target <name>" >&2
+        if [ -f "$REPO_ROOT/.deploy_secret" ]; then
+            echo "       (a plain .deploy_secret also exists — rename it to .deploy_secret.<name>, e.g." >&2
+            echo "        .deploy_secret.production, so every deploy names its destination)" >&2
+        fi
+        exit 1
+    fi
+fi
+
 for tool in git curl base64; do
     command -v "$tool" >/dev/null 2>&1 || { echo "error: '$tool' is required but not installed" >&2; exit 1; }
 done
 
 if command -v shasum >/dev/null 2>&1; then
     sha1_of() { shasum -a 1 "$1" | awk '{print $1}'; }
+    SHA_BATCH=(shasum -a 1)
 elif command -v sha1sum >/dev/null 2>&1; then
     sha1_of() { sha1sum "$1" | awk '{print $1}'; }
+    SHA_BATCH=(sha1sum)
 else
     echo "error: need 'shasum' or 'sha1sum'" >&2; exit 1
 fi
 
 if command -v gstat >/dev/null 2>&1; then
     size_of() { gstat -c %s "$1"; }
+    batch_stat() { xargs -0 gstat -c '%s %Y %n' --; }
 elif stat -f %z . >/dev/null 2>&1; then
     size_of() { stat -f %z "$1"; }
+    batch_stat() { xargs -0 stat -f '%z %m %N' --; }
 else
     size_of() { stat -c %s "$1"; }
+    batch_stat() { xargs -0 stat -c '%s %Y %n' --; }
 fi
 
 load_secret() {
@@ -162,10 +242,11 @@ unset url_authority url_host
 cd "$REPO_ROOT" || { echo "error: cannot cd into $REPO_ROOT" >&2; exit 1; }
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: not a git repository" >&2; exit 1; }
 
-if [ "$SECRET_FROM_FILE" -eq 1 ] && git ls-files --error-unmatch -- .deploy_secret >/dev/null 2>&1; then
-    echo "error: .deploy_secret is committed to this git repository — refusing." >&2
+SECRET_BASENAME="${SECRET_FILE##*/}"
+if [ "$SECRET_FROM_FILE" -eq 1 ] && git ls-files --error-unmatch -- "$SECRET_BASENAME" >/dev/null 2>&1; then
+    echo "error: $SECRET_BASENAME is committed to this git repository — refusing." >&2
     echo "       It holds your deploy token and must be gitignored. If this is NOT your repo, do not run phpush here." >&2
-    echo "       Otherwise:  git rm --cached .deploy_secret && echo .deploy_secret >> .gitignore" >&2
+    echo "       Otherwise:  git rm --cached $SECRET_BASENAME && echo '.deploy_secret*' >> .gitignore" >&2
     exit 1
 fi
 
@@ -191,7 +272,10 @@ LOCAL_LIST="$TMPDIR_WORK/local"
 LOCAL_PH="$TMPDIR_WORK/local_ph"
 SERVER_LIST="$TMPDIR_WORK/server"
 SERVER_PH="$TMPDIR_WORK/server_ph"
+ELIG_TXT="$TMPDIR_WORK/eligible"
 CURLRC="$TMPDIR_WORK/curlrc"
+USE_LOCAL_CACHE=0
+LOCAL_CACHE_FILE=""
 
 ( umask 077; : > "$CURLRC" )
 esc_token="${DEPLOY_TOKEN//\\/\\\\}"
@@ -217,8 +301,8 @@ bad_path() {
 add_delete() {
     pushignore_match "$1" && return 0
     case "$1" in
-        *"$NL"*|*"$TAB"*|*"$CR"*|*:*)
-            echo "warning: not deleting $(printf '%q' "$1") — its name has a ':' or control char, so PHPush could never have deployed it (nothing to remove)" >&2
+        *"$NL"*|*"$TAB"*|*"$CR"*|*:*|*\\*)
+            echo "warning: not deleting $(printf '%q' "$1") — its name has a ':', '\\' or control char, so PHPush could never have deployed it (nothing to remove)" >&2
             return 0 ;;
     esac
     DELETES+=("$1")
@@ -255,22 +339,35 @@ pushignore_match() {
 }
 
 push_chunk() {
-    curl -fsS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 600 \
+    local body code
+    body="$(curl -sS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 600 \
         -H "X-Deploy-Path: $1" \
         -H "X-Deploy-Mode: $2" \
         -H "X-Deploy-Final: $3" \
         -H "X-Deploy-Offset: $5" \
         -H "X-Deploy-Snapshot: $SNAPSHOT_ID" \
+        -H "X-Deploy-No-Adopt: $ADOPT_BLOCK" \
         -H "Content-Type: application/octet-stream" \
         --data-binary "@$4" \
-        "$DEPLOY_URL?action=push"
+        -w $'\n%{http_code}' \
+        "$DEPLOY_URL?action=push")" || return 1
+    code="${body##*$NL}"
+    body="${body%$NL*}"
+    if [ "$code" != "200" ]; then
+        echo "  ! server rejected the upload (HTTP $code): $body" >&2
+        case "$body" in
+            *'backup failed'*) echo "  ! fix permissions/space on the host's .phpush-backups, or deploy without a safety net using --no-backup." >&2 ;;
+        esac
+        return 1
+    fi
+    printf '%s' "$body"
 }
 
 upload_one() {
-    local rel="$1" src="$2" size b64 want resp chunkno chunk_start offset mode final
+    local rel="$1" src="$2" want="${3:-}" size b64 resp chunkno chunk_start offset mode final
     size="$(size_of "$src")"
     b64="$(b64url "$rel")"
-    want="$(sha1_of "$src")"
+    [ -n "$want" ] || want="$(sha1_of "$src")"
     case "$size" in ''|*[!0-9]*) echo "  ! cannot size: $rel" >&2; return 1 ;; esac
     [ -n "$want" ] || { echo "  ! cannot hash: $rel" >&2; return 1; }
     if [ "$size" -le "$CHUNK_BYTES" ]; then
@@ -301,11 +398,15 @@ is_head_symlink() { grep -Fxq -- "$1" "$SYMLINK_LIST" 2>/dev/null; }
 
 run_uploads() {
     upload_failures=0
-    local total n rel src
+    uploads_done=0
+    local total n rel src want
     total="${#UPLOADS[@]}"
     [ "$total" -gt 0 ] || return 0
     n=0
-    for rel in "${UPLOADS[@]}"; do
+    while [ "$n" -lt "$total" ]; do
+        rel="${UPLOADS[$n]}"
+        want=""
+        [ "${#UPLOAD_HASHES[@]}" -gt "$n" ] && want="${UPLOAD_HASHES[$n]}"
         n=$((n + 1))
         printf '\r  uploading %d/%d ' "$n" "$total"
         if [ "$GIT_MODE" -eq 1 ] && [ "$MODE_FULL" -eq 0 ]; then
@@ -313,9 +414,13 @@ run_uploads() {
         else
             src="$SRC_PREFIX/$rel"
         fi
-        upload_one "$rel" "$src" || { upload_failures=$((upload_failures + 1)); echo "  FAILED: $rel" >&2; }
+        if upload_one "$rel" "$src" "$want"; then
+            uploads_done=$((uploads_done + 1))
+        else
+            upload_failures=$((upload_failures + 1)); echo "  FAILED: $rel" >&2
+        fi
     done
-    printf '\r  uploaded %d/%d file(s)        \n' "$((total - upload_failures))" "$total"
+    printf '\r  uploaded %d/%d file(s)        \n' "$uploads_done" "$total"
 }
 
 run_deletes() {
@@ -363,9 +468,11 @@ fetch_manifest() {
 plan_from_manifest() {
     LC_ALL=C sort "$LOCAL_LIST" > "$LOCAL_PH"
     UPLOADS=()
+    UPLOAD_HASHES=()
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         UPLOADS+=("${line%%$'\t'*}")
+        UPLOAD_HASHES+=("${line#*$'\t'}")
     done < <(LC_ALL=C comm -23 "$LOCAL_PH" "$SERVER_PH")
     DELETES=()
     while IFS= read -r rel; do
@@ -376,38 +483,304 @@ plan_from_manifest() {
 }
 
 add_local() {
-    local rel="$1" src="$2" h
+    local rel="$1" src="$2"
     case "$rel" in
-        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example|.pushignore|*/.pushignore) return 0 ;;
+        .deploy_secret|.deploy_secret.*|*/.deploy_secret|*/.deploy_secret.*|.pushignore|*/.pushignore) return 0 ;;
     esac
     pushignore_match "$rel" && return 0
     [ -L "$src" ] && { echo "warning: skipping symlink (not deployed): $rel" >&2; return 0; }
     case "$rel" in *:*) echo "warning: skipping '$rel' — ':' is not allowed in deployed filenames (the server rejects it)" >&2; return 0 ;; esac
+    case "$rel" in *\\*) echo "warning: skipping '$rel' — '\\' is not allowed in deployed filenames (the server would rewrite it to a '/' path)" >&2; return 0 ;; esac
     bad_path "$rel" && return 0
     [ -f "$src" ] || return 0
-    h="$(sha1_of "$src")"
-    [ -n "$h" ] || { echo "error: failed to hash $rel" >&2; exit 1; }
-    printf '%s\t%s\n' "$rel" "$h" >> "$LOCAL_LIST"
+    printf '%s\n' "$rel" >> "$ELIG_TXT"
     local_count=$((local_count + 1))
 }
 
-SERVER_MANAGED="unknown"
-ver_resp="$(curl -fsS -K "$CURLRC" --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=version" 2>/dev/null || true)"
-if [ -n "$ver_resp" ]; then
-    server_version="$(printf '%s' "$ver_resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-    case "$ver_resp" in
-        *'"managed":true'*)  SERVER_MANAGED=true ;;
-        *'"managed":false'*) SERVER_MANAGED=false ;;
-    esac
-    if [ -n "$server_version" ] && [ "$server_version" != "$VERSION" ]; then
-        echo "note: server phpush.php is v$server_version but this client is v$VERSION — re-upload phpush.php to match" >&2
+# Hash every collected file into LOCAL_LIST ("rel<TAB>sha1"). One batched stat
+# pass fingerprints everything; only files whose size+mtime is not in the local
+# cache are hashed, in one batched shasum call, instead of one process per file.
+hash_local_files() {
+    : > "$LOCAL_LIST"
+    [ -s "$ELIG_TXT" ] || return 0
+    local run_ts cache_read rel tag c1 c2 c3 c4
+    run_ts=""
+    if [ "$USE_LOCAL_CACHE" -eq 1 ] && [ -n "$LOCAL_CACHE_FILE" ] && : > "$LOCAL_CACHE_FILE.stamp" 2>/dev/null; then
+        run_ts="$(printf '%s\0' "$LOCAL_CACHE_FILE.stamp" | batch_stat 2>/dev/null | awk '{print $2}' || true)"
+        rm -f "$LOCAL_CACHE_FILE.stamp" 2>/dev/null || true
     fi
+    case "$run_ts" in ''|*[!0-9]*) run_ts="$(date +%s)" ;; esac
+    while IFS= read -r rel; do
+        printf '%s/%s\0' "$SRC_PREFIX" "$rel"
+    done < "$ELIG_TXT" > "$TMPDIR_WORK/src_nul"
+    batch_stat < "$TMPDIR_WORK/src_nul" > "$TMPDIR_WORK/statlist" \
+        || { echo "error: could not stat local files (did a file vanish mid-run?)" >&2; exit 1; }
+    cache_read=/dev/null
+    if [ "$USE_LOCAL_CACHE" -eq 1 ] && [ "$REHASH" -eq 0 ] && [ -f "$LOCAL_CACHE_FILE" ]; then
+        cache_read="$LOCAL_CACHE_FILE"
+    fi
+    LC_ALL=C awk -v cachef="$cache_read" -v prefix="$SRC_PREFIX/" '
+        BEGIN {
+            gen = 0
+            while ((getline cl < cachef) > 0) {
+                if (substr(cl, 1, 16) == "#phpush-cache-v1") { split(cl, hh, " "); gen = hh[2] + 0; continue }
+                np = split(cl, ff, "\t")
+                if (np != 4) continue
+                known[ff[1] SUBSEP ff[2] SUBSEP ff[4]] = ff[3]
+            }
+            close(cachef)
+        }
+        {
+            sp1 = index($0, " "); if (sp1 == 0) next
+            size = substr($0, 1, sp1 - 1)
+            rest = substr($0, sp1 + 1)
+            sp2 = index(rest, " "); if (sp2 == 0) next
+            mtime = substr(rest, 1, sp2 - 1)
+            path = substr(rest, sp2 + 1)
+            if (index(path, prefix) == 1) path = substr(path, length(prefix) + 1)
+            key = size SUBSEP mtime SUBSEP path
+            if ((key in known) && (mtime + 0) + 2 <= gen)
+                printf "H\t%s\t%s\t%s\t%s\n", size, mtime, known[key], path
+            else
+                printf "N\t%s\t%s\t%s\n", size, mtime, path
+        }' "$TMPDIR_WORK/statlist" > "$TMPDIR_WORK/hashplan"
+    : > "$TMPDIR_WORK/tohash"
+    : > "$TMPDIR_WORK/pending"
+    : > "$TMPDIR_WORK/newcache"
+    while IFS=$'\t' read -r tag c1 c2 c3 c4; do
+        case "$tag" in
+            H)  printf '%s\t%s\n' "$c4" "$c3" >> "$LOCAL_LIST"
+                printf '%s\t%s\t%s\t%s\n' "$c1" "$c2" "$c3" "$c4" >> "$TMPDIR_WORK/newcache" ;;
+            N)  printf '%s/%s\0' "$SRC_PREFIX" "$c3" >> "$TMPDIR_WORK/tohash"
+                printf '%s\t%s\t%s\n' "$c3" "$c1" "$c2" >> "$TMPDIR_WORK/pending" ;;
+        esac
+    done < "$TMPDIR_WORK/hashplan"
+    if [ -s "$TMPDIR_WORK/tohash" ]; then
+        xargs -0 "${SHA_BATCH[@]}" -- < "$TMPDIR_WORK/tohash" > "$TMPDIR_WORK/hashed" \
+            || { echo "error: failed to hash local files" >&2; exit 1; }
+        LC_ALL=C awk -v prefix="$SRC_PREFIX/" -v ll="$LOCAL_LIST" -v nc="$TMPDIR_WORK/newcache" '
+            NR == FNR {
+                np = split($0, ff, "\t")
+                if (np != 3) next
+                sizes[ff[1]] = ff[2]; mtimes[ff[1]] = ff[3]
+                next
+            }
+            {
+                hash = substr($0, 1, 40)
+                path = substr($0, 43)
+                if (index(path, prefix) == 1) path = substr(path, length(prefix) + 1)
+                if (!(path in sizes)) next
+                printf "%s\t%s\n", path, hash >> ll
+                printf "%s\t%s\t%s\t%s\n", sizes[path], mtimes[path], hash, path >> nc
+            }' "$TMPDIR_WORK/pending" "$TMPDIR_WORK/hashed"
+    fi
+    if [ "$(wc -l < "$LOCAL_LIST" | tr -d ' ')" != "$(wc -l < "$ELIG_TXT" | tr -d ' ')" ]; then
+        echo "error: hashing did not cover every file — refusing to continue with an incomplete list" >&2
+        exit 1
+    fi
+    if [ "$USE_LOCAL_CACHE" -eq 1 ] && [ -n "$LOCAL_CACHE_FILE" ]; then
+        {
+            printf '#phpush-cache-v1 %s\n' "$run_ts"
+            cat "$TMPDIR_WORK/newcache"
+        } > "$LOCAL_CACHE_FILE.tmp" 2>/dev/null && mv -f "$LOCAL_CACHE_FILE.tmp" "$LOCAL_CACHE_FILE" 2>/dev/null \
+            || rm -f "$LOCAL_CACHE_FILE.tmp" 2>/dev/null || true
+    fi
+}
+
+fmt_bytes() {
+    awk -v b="$1" 'BEGIN {
+        if (b < 0) { print "unknown"; exit }
+        if (b < 1024) { printf "%d B", b; exit }
+        if (b < 1048576) { printf "%.1f KB", b/1024; exit }
+        if (b < 1073741824) { printf "%.1f MB", b/1048576; exit }
+        printf "%.2f GB", b/1073741824
+    }'
+}
+
+if [ "$SECRET_FROM_FILE" -eq 1 ]; then TOKEN_SOURCE="$SECRET_BASENAME"; else TOKEN_SOURCE="the DEPLOY_TOKEN environment variable"; fi
+
+if [ "$DOCTOR" -eq 1 ]; then
+    DOCTOR_PROBLEMS=0
+    d_ok()   { printf '  ok  %s\n' "$1"; }
+    d_bad()  { DOCTOR_PROBLEMS=$((DOCTOR_PROBLEMS+1)); printf '  !!  %s\n' "$1"; }
+    d_info() { printf '  --  %s\n' "$1"; }
+
+    echo "phpush doctor — checking $DEPLOY_URL${TARGET_NAME:+   [$TARGET_NAME]}"
+    echo
+
+    case "$DEPLOY_URL" in
+        https://*) d_ok "target uses HTTPS" ;;
+        *) d_info "target uses plain http to localhost (fine for testing only)" ;;
+    esac
+
+    if [ "$SECRET_FROM_FILE" -eq 1 ]; then
+        if git check-ignore -q -- "$SECRET_BASENAME" 2>/dev/null; then
+            d_ok "$SECRET_BASENAME is gitignored"
+        else
+            d_bad "$SECRET_BASENAME is NOT gitignored — add '.deploy_secret*' to .gitignore before it gets committed"
+        fi
+    else
+        d_info "config comes from environment variables (no secret file to check)"
+    fi
+
+    probe_body="$TMPDIR_WORK/probe"
+    if ! pcode="$(curl -sS -o "$probe_body" -w '%{http_code}' --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=version" 2>"$TMPDIR_WORK/proberr")"; then
+        d_bad "cannot reach the receiver: $(tr -d '\n' < "$TMPDIR_WORK/proberr")"
+        echo
+        echo "1 problem found — fix it and re-run 'phpush doctor'."
+        exit 1
+    fi
+    if grep -q '<?php' "$probe_body" 2>/dev/null; then
+        d_bad "CRITICAL: the host serves phpush.php as PLAIN TEXT instead of running it — anyone can read the deploy token in the source. Fix PHP execution on the host, then generate a NEW token (treat the current one as public)."
+        echo
+        echo "1 critical problem found — do not deploy until this is fixed."
+        exit 1
+    fi
+    if [ "$pcode" = "401" ] && grep -q '"unauthorized"' "$probe_body" 2>/dev/null; then
+        d_ok "receiver runs as PHP and rejects requests without a token (HTTP 401)"
+    elif [ "$pcode" = "500" ] && grep -q 'token not configured' "$probe_body" 2>/dev/null; then
+        d_bad "the receiver has no token configured — paste your token into DEPLOY_TOKEN in phpush.php (or set PHPUSH_TOKEN on the host) and re-upload"
+    else
+        d_bad "unexpected reply to a token-less request (HTTP $pcode) — expected 401 unauthorized. Is DEPLOY_URL pointing at phpush.php? A redirect, login page, or security plugin may be in the way."
+    fi
+
+    ver_resp="$(curl -sS -K "$CURLRC" --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=version" 2>/dev/null || true)"
+    case "$ver_resp" in
+        *'"ok":true'*)
+            d_ok "deploy token accepted"
+            server_version="$(printf '%s' "$ver_resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+            if [ "$server_version" = "$VERSION" ]; then
+                d_ok "client and server both v$VERSION"
+            else
+                d_bad "version skew: server is v${server_version:-unknown}, client is v$VERSION — re-upload phpush.php"
+            fi
+            case "$ver_resp" in
+                *'"managed":true'*)  d_info "server has been deployed to before (managed)" ;;
+                *'"managed":false'*) d_info "server not deployed to yet — a first deploy that must delete existing files will ask for --adopt" ;;
+            esac
+            ;;
+        *'"error":"unauthorized"'*)
+            d_bad "the server REJECTED the deploy token — DEPLOY_TOKEN in $TOKEN_SOURCE must match the token in phpush.php"
+            ;;
+        *)
+            d_bad "could not verify the token (no valid reply from the receiver)"
+            ;;
+    esac
+
+    st="$(curl -sS -K "$CURLRC" --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=status" 2>/dev/null || true)"
+    max_backups=""
+    backups_on_disk=""
+    case "$st" in
+        *'"ok":true'*)
+            php_ver="$(printf '%s' "$st" | sed -n 's/.*"php":"\([^"]*\)".*/\1/p')"
+            [ -n "$php_ver" ] && d_info "server PHP $php_ver"
+            post_max="$(printf '%s' "$st" | sed -n 's/.*"post_max_bytes":\(-\{0,1\}[0-9][0-9]*\).*/\1/p')"
+            if [ -n "$post_max" ] && [ "$post_max" -gt 0 ] && [ "$CHUNK_BYTES" -gt "$post_max" ]; then
+                d_bad "upload chunks ($(fmt_bytes "$CHUNK_BYTES")) exceed the host's post_max_size ($(fmt_bytes "$post_max")) — uploads will fail with HTTP 413. Set DEPLOY_CHUNK_BYTES=$post_max or lower (a plain number of bytes, not '2M')."
+            elif [ -n "$post_max" ] && [ "$post_max" -gt 0 ]; then
+                d_ok "chunk size $(fmt_bytes "$CHUNK_BYTES") fits the host's post_max_size ($(fmt_bytes "$post_max"))"
+            fi
+            free_b="$(printf '%s' "$st" | sed -n 's/.*"disk_free_bytes":\(-\{0,1\}[0-9][0-9]*\).*/\1/p')"
+            if [ -n "$free_b" ] && [ "$free_b" -ge 0 ]; then
+                if [ "$free_b" -lt 52428800 ]; then
+                    d_bad "the host reports only $(fmt_bytes "$free_b") of free disk space — deploys and backups may start failing"
+                else
+                    d_ok "free disk space on the host: $(fmt_bytes "$free_b")"
+                fi
+            fi
+            max_backups="$(printf '%s' "$st" | sed -n 's/.*"max_backups":\(-\{0,1\}[0-9][0-9]*\).*/\1/p')"
+            backups_on_disk="$(printf '%s' "$st" | sed -n 's/.*"backups_on_disk":\([0-9][0-9]*\).*/\1/p')"
+            case "$st" in
+                *'"backups_writable":true'*)  d_ok "backup snapshots enabled (keeps the last ${max_backups:-?}) and writable" ;;
+                *'"backups_writable":false'*) d_bad "backups are enabled but the server CANNOT write them (permissions or disk) — deploys will refuse to change files until this is fixed (or deploy with --no-backup)" ;;
+                *)
+                    if [ -n "$backups_on_disk" ] && [ "$backups_on_disk" -gt 0 ]; then
+                        d_info "backups are turned off (MAX_BACKUPS = 0) but $backups_on_disk old snapshot(s) remain on the server — delete .phpush-backups/ if you no longer want them"
+                    else
+                        d_info "backups are turned off on the server (MAX_BACKUPS = 0) — no rollback safety net"
+                    fi ;;
+            esac
+            ;;
+        *)
+            d_info "server has no status support (predates v0.7.0) — upgrade phpush.php for host-limit checks"
+            ;;
+    esac
+
+    if { [ -n "$max_backups" ] && [ "$max_backups" -gt 0 ]; } || { [ -n "${backups_on_disk:-}" ] && [ "${backups_on_disk:-0}" -gt 0 ]; }; then
+        bp_url="${DEPLOY_URL%/*}/.phpush-backups/probe.html"
+        bp_body="$TMPDIR_WORK/bprobe"
+        bp_code="$(curl -sS -o "$bp_body" -w '%{http_code}' --connect-timeout 15 --max-time 30 "$bp_url" 2>/dev/null)" || bp_code=000
+        if [ "$bp_code" = "200" ] && grep -q 'phpush-probe' "$bp_body" 2>/dev/null; then
+            d_bad "the backup folder is READABLE from the web ($bp_url) — this host ignores .htaccess (nginx?), so old copies of your files can be fetched by anyone who guesses a path. Protect /.phpush-backups/ in the server config, or set MAX_BACKUPS = 0 in phpush.php."
+        elif [ "$bp_code" = "401" ] || [ "$bp_code" = "403" ] || [ "$bp_code" = "404" ]; then
+            d_ok "backup folder is not readable from the web (HTTP $bp_code)"
+        else
+            d_info "could not verify backup-folder protection (HTTP $bp_code for $bp_url)"
+        fi
+    fi
+
+    echo
+    if [ "$DOCTOR_PROBLEMS" -eq 0 ]; then
+        echo "All checks passed. This setup looks safe to deploy to."
+        exit 0
+    fi
+    echo "$DOCTOR_PROBLEMS problem(s) found (lines marked !!) — fix them and re-run 'phpush doctor'."
+    exit 1
+fi
+
+SERVER_MANAGED="unknown"
+SERVER_VERSION=""
+if [ "$NO_HANDSHAKE" -eq 0 ]; then
+    if ! ver_raw="$(curl -sS -K "$CURLRC" --connect-timeout 15 --max-time 30 -w "%{http_code}" -o "$TMPDIR_WORK/ver_body" "$DEPLOY_URL?action=version" 2>"$TMPDIR_WORK/ver_err")"; then
+        echo "error: could not reach $DEPLOY_URL" >&2
+        sed 's/^/       /' "$TMPDIR_WORK/ver_err" >&2
+        echo "       Check DEPLOY_URL, your network, and that phpush.php is uploaded. 'phpush doctor' runs the full checkup." >&2
+        exit 1
+    fi
+    ver_code="$ver_raw"
+    ver_resp="$(cat "$TMPDIR_WORK/ver_body" 2>/dev/null || true)"
+    case "$ver_resp" in
+        *'"ok":true'*'"version"'*)
+            SERVER_VERSION="$(printf '%s' "$ver_resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+            case "$ver_resp" in
+                *'"managed":true'*)  SERVER_MANAGED=true ;;
+                *'"managed":false'*) SERVER_MANAGED=false ;;
+            esac
+            if [ -n "$SERVER_VERSION" ] && [ "$SERVER_VERSION" != "$VERSION" ]; then
+                echo "note: server phpush.php is v$SERVER_VERSION but this client is v$VERSION — re-upload phpush.php to match" >&2
+            fi
+            ;;
+        *'<?php'*)
+            echo "error: $DEPLOY_URL returned PHP SOURCE CODE instead of running it." >&2
+            echo "       The host is serving phpush.php as plain text — anyone can read the deploy token inside it." >&2
+            echo "       Fix PHP execution on the host, then generate a NEW token (treat the current one as public)." >&2
+            exit 1
+            ;;
+        *'"error":"unauthorized"'*)
+            echo "error: the server rejected the deploy token (HTTP $ver_code)." >&2
+            echo "       DEPLOY_TOKEN in $TOKEN_SOURCE must match the token in phpush.php on the server." >&2
+            exit 1
+            ;;
+        *'token not configured'*)
+            echo "error: the server's phpush.php has no token configured (HTTP $ver_code)." >&2
+            echo "       Paste your token into DEPLOY_TOKEN in phpush.php (or set PHPUSH_TOKEN on the host) and re-upload." >&2
+            exit 1
+            ;;
+        *)
+            echo "error: $DEPLOY_URL did not answer like a PHPush receiver (HTTP $ver_code)." >&2
+            echo "       Likely causes: wrong DEPLOY_URL, phpush.php not uploaded there, an outdated phpush.php" >&2
+            echo "       (re-upload the current one), a redirect/login page, or a security plugin/firewall" >&2
+            echo "       intercepting the request. 'phpush doctor' runs the full checkup." >&2
+            echo "       If this host genuinely blocks the check, re-run with --no-handshake (deletes then need --adopt)." >&2
+            exit 1
+            ;;
+    esac
 fi
 
 if [ "$LIST_BACKUPS" -eq 1 ]; then
     resp="$(curl -fsS -K "$CURLRC" --connect-timeout 15 --max-time 60 "$DEPLOY_URL?action=backups")" \
         || { echo "error: could not list backups (server may predate rollback support)" >&2; exit 1; }
-    ids="$(printf '%s' "$resp" | grep -o '"id":"[^"]*"' | sed 's/"id":"\([^"]*\)"/\1/')"
+    ids="$(printf '%s' "$resp" | grep -o '"id":"[^"]*"' | sed 's/"id":"\([^"]*\)"/\1/' || true)"
     if [ -z "$ids" ]; then
         echo "No rollback snapshots on the server yet."
     else
@@ -424,14 +797,29 @@ if [ "$ROLLBACK" -eq 1 ]; then
     url="$DEPLOY_URL?action=rollback"
     [ -n "$ROLLBACK_ID" ] && url="$url&snapshot=$ROLLBACK_ID"
     [ "$DRY_RUN" -eq 1 ] && url="$url&dry=1"
+    [ "$NO_BACKUP" -eq 1 ] && url="$url&nosnap=1"
     body="$(curl -sS -K "$CURLRC" -X POST --connect-timeout 15 --max-time 300 -w $'\n%{http_code}' "$url")" \
         || { echo "error: rollback request failed" >&2; exit 1; }
     code="${body##*$NL}"; body="${body%$NL*}"
+    snap="$(printf '%s' "$body" | sed -n 's/.*"snapshot":"\([^"]*\)".*/\1/p')"
+    undo="$(printf '%s' "$body" | sed -n 's/.*"undo":"\([^"]*\)".*/\1/p')"
     if [ "$code" != "200" ]; then
-        echo "error: rollback failed (HTTP $code): $body" >&2
+        case "$body" in
+            *'"error":"partial rollback"'*)
+                rc="$(printf '%s' "$body" | sed -n 's/.*"restored":\([0-9]*\).*/\1/p')"
+                mc="$(printf '%s' "$body" | sed -n 's/.*"removed":\([0-9]*\).*/\1/p')"
+                failed="$(printf '%s' "$body" | sed -n 's/.*"failed":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | sed 's/^"//; s/"$//; s/^/  ! /')"
+                echo "error: PARTIAL rollback of snapshot $snap — restored ${rc:-0}, removed ${mc:-0}, but these file(s) FAILED:" >&2
+                printf '%s\n' "$failed" >&2
+                echo "       The server is between states. Fix the cause (permissions/disk) and re-run: phpush --rollback $snap" >&2
+                echo "       (the --git commit marker was cleared, so the next --git deploy does a full resync)" >&2
+                [ -n "$undo" ] && echo "       To undo what was applied instead:  phpush --rollback $undo" >&2
+                ;;
+            *)
+                echo "error: rollback failed (HTTP $code): $body" >&2 ;;
+        esac
         exit 1
     fi
-    snap="$(printf '%s' "$body" | sed -n 's/.*"snapshot":"\([^"]*\)".*/\1/p')"
     if [ "$DRY_RUN" -eq 1 ]; then
         rc="$(printf '%s' "$body" | sed -n 's/.*"restore_count":\([0-9]*\).*/\1/p')"
         mc="$(printf '%s' "$body" | sed -n 's/.*"remove_count":\([0-9]*\).*/\1/p')"
@@ -442,6 +830,7 @@ if [ "$ROLLBACK" -eq 1 ]; then
         rc="$(printf '%s' "$body" | sed -n 's/.*"restored":\([0-9]*\).*/\1/p')"
         mc="$(printf '%s' "$body" | sed -n 's/.*"removed":\([0-9]*\).*/\1/p')"
         echo "Rolled back to snapshot $snap: restored ${rc:-0} file(s), removed ${mc:-0} file(s)."
+        [ -n "$undo" ] && echo "Undo this rollback:  phpush --rollback $undo"
         [ "$GIT_MODE" -eq 1 ] && echo "note: run 'phpush --git --rehash' if you next deploy with --git." >&2
     fi
     exit 0
@@ -460,6 +849,7 @@ LAST=""
 MODE_FULL=1
 SRC_PREFIX="."
 UPLOADS=()
+UPLOAD_HASHES=()
 DELETES=()
 
 if [ "$GIT_MODE" -eq 1 ]; then
@@ -490,7 +880,7 @@ if [ "$GIT_MODE" -eq 1 ]; then
         STAGING="$TMPDIR_WORK/staging"
         mkdir -p "$STAGING"
         SRC_PREFIX="$STAGING"
-        : > "$LOCAL_LIST"; local_count=0
+        : > "$LOCAL_LIST"; : > "$ELIG_TXT"; local_count=0
         while IFS= read -r -d '' entry; do
             case "${entry%% *}" in
                 120000) echo "warning: skipping symlink (not deployed): ${entry#*$TAB}" >&2; continue ;;
@@ -501,11 +891,18 @@ if [ "$GIT_MODE" -eq 1 ]; then
             pushignore_match "$rel" && continue
             reldir="$(dirname "$rel")"
             [ "$reldir" = "." ] || mkdir -p "$STAGING/$reldir"
+            if [ -e "$STAGING/$rel" ]; then
+                echo "error: committed path '$rel' collides with another committed path on this machine's filesystem" >&2
+                echo "       (this disk treats names differing only in case or unicode form as the same file)." >&2
+                echo "       Deploying would send the wrong contents — rename one of the paths and re-commit." >&2
+                exit 1
+            fi
             git show "$HEAD:$rel" > "$STAGING/$rel" 2>/dev/null || { echo "error: cannot read committed blob: $rel" >&2; exit 1; }
             add_local "$rel" "$STAGING/$rel"
         done < <(git ls-tree -r -z "$HEAD")
         [ "$bad_names" -eq 0 ] || { echo "error: rename the path(s) above and re-commit" >&2; exit 1; }
         [ "$local_count" -gt 0 ] || { echo "error: commit ${HEAD:0:10} has no deployable files — refusing to wipe the server" >&2; exit 1; }
+        hash_local_files
         fetch_manifest
         plan_from_manifest
     else
@@ -513,19 +910,21 @@ if [ "$GIT_MODE" -eq 1 ]; then
             case "$status" in
                 R*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
                     add_delete "$oldp"
+                    case "$newp" in .deploy_secret|.deploy_secret.*|*/.deploy_secret|*/.deploy_secret.*|.pushignore|*/.pushignore) continue ;; esac
                     pushignore_match "$newp" && continue
                     if is_head_symlink "$newp"; then echo "warning: skipping symlink (not deployed): $newp" >&2; add_delete "$newp"; continue; fi
-                    case "$newp" in *:*) echo "warning: skipping rename to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
+                    case "$newp" in *:*|*\\*) echo "warning: skipping rename to '$newp' — ':' and '\\' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 C*) IFS= read -r -d '' oldp; IFS= read -r -d '' newp
+                    case "$newp" in .deploy_secret|.deploy_secret.*|*/.deploy_secret|*/.deploy_secret.*|.pushignore|*/.pushignore) continue ;; esac
                     pushignore_match "$newp" && continue
                     if is_head_symlink "$newp"; then echo "warning: skipping symlink (not deployed): $newp" >&2; add_delete "$newp"; continue; fi
-                    case "$newp" in *:*) echo "warning: skipping copy to '$newp' — ':' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
+                    case "$newp" in *:*|*\\*) echo "warning: skipping copy to '$newp' — ':' and '\\' not allowed" >&2 ;; *) bad_path "$newp" || UPLOADS+=("$newp") ;; esac ;;
                 D*) IFS= read -r -d '' p
                     add_delete "$p" ;;
                 *)  IFS= read -r -d '' p
                     case "$p" in
-                        .deploy_secret|.deploy_secret.example|*/.deploy_secret|*/.deploy_secret.example|.pushignore|*/.pushignore) continue ;;
-                        *:*) echo "warning: skipping '$p' — ':' is not allowed in deployed filenames" >&2; continue ;;
+                        .deploy_secret|.deploy_secret.*|*/.deploy_secret|*/.deploy_secret.*|.pushignore|*/.pushignore) continue ;;
+                        *:*|*\\*) echo "warning: skipping '$p' — ':' and '\\' are not allowed in deployed filenames" >&2; continue ;;
                     esac
                     pushignore_match "$p" && continue
                     if is_head_symlink "$p"; then echo "warning: skipping symlink (not deployed): $p" >&2; add_delete "$p"; continue; fi
@@ -535,10 +934,13 @@ if [ "$GIT_MODE" -eq 1 ]; then
         [ "$bad_names" -eq 0 ] || { echo "error: rename the path(s) above and re-commit" >&2; exit 1; }
     fi
 else
-    : > "$LOCAL_LIST"; local_count=0
+    USE_LOCAL_CACHE=1
+    LOCAL_CACHE_FILE="$(git rev-parse --git-dir)/phpush-hash-cache"
+    : > "$LOCAL_LIST"; : > "$ELIG_TXT"; local_count=0
     while IFS= read -r -d '' rel; do add_local "$rel" "./$rel"; done < <(git ls-files --cached --others --exclude-standard -z)
     [ "$bad_names" -eq 0 ] || { echo "error: rename the path(s) above (control characters break the deploy protocol) and re-run" >&2; exit 1; }
     [ "$local_count" -gt 0 ] || { echo "error: no deployable files found — refusing to mirror an empty tree" >&2; exit 1; }
+    hash_local_files
     fetch_manifest
     plan_from_manifest
 fi
@@ -547,24 +949,61 @@ suppressed_deletes=0
 if [ "$NO_DELETE" -eq 1 ]; then
     suppressed_deletes="${#DELETES[@]}"
     DELETES=()
+    if [ "$suppressed_deletes" -gt 0 ] && [ "$SERVER_MANAGED" != true ]; then ADOPT_BLOCK=1; fi
 fi
 delete_failures=0
 
-if [ "$SERVER_MANAGED" = false ] && [ "${#DELETES[@]}" -gt 0 ] && [ "$ADOPT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    echo "error: the server has ${#DELETES[@]} file(s) PHPush has never deployed, and this run would DELETE them to mirror your project." >&2
-    echo "       To take over this directory (this WILL delete those files):  re-run with --adopt" >&2
-    echo "       To upload without deleting anything:                         re-run with --no-delete" >&2
-    echo "       To review exactly what would change first:                   phpush --dry-run" >&2
+if [ "$SERVER_MANAGED" != true ] && [ "${#DELETES[@]}" -gt 0 ] && [ "$ADOPT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$SERVER_MANAGED" = false ]; then
+        echo "error: the server has ${#DELETES[@]} file(s) PHPush has never deployed, and this run would DELETE them to mirror your project." >&2
+        echo "       To take over this directory (this WILL delete those files):  re-run with --adopt" >&2
+        echo "       To upload without deleting anything:                         re-run with --no-delete" >&2
+        echo "       To review exactly what would change first:                   phpush --dry-run" >&2
+    else
+        echo "error: --no-handshake means the server's deploy history could not be verified, and this run would DELETE ${#DELETES[@]} file(s)." >&2
+        echo "       Re-run with --adopt to allow the deletes, or --no-delete to only upload." >&2
+        echo "       To review exactly what would change first:  phpush --dry-run" >&2
+    fi
     exit 1
 fi
 
-echo "Target : $DEPLOY_URL"
+total_upload_bytes=0
+if [ "${#UPLOADS[@]}" -gt 0 ]; then
+    if [ "$GIT_MODE" -eq 1 ] && [ "$MODE_FULL" -eq 0 ]; then
+        for _rel in "${UPLOADS[@]}"; do
+            _sz="$(git cat-file -s "$HEAD:$_rel" 2>/dev/null || echo 0)"
+            case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+            total_upload_bytes=$((total_upload_bytes + _sz))
+        done
+    elif [ -s "$TMPDIR_WORK/statlist" ]; then
+        printf '%s\n' "${UPLOADS[@]}" > "$TMPDIR_WORK/upload_names"
+        total_upload_bytes="$(LC_ALL=C awk -v prefix="$SRC_PREFIX/" '
+            NR == FNR { want[$0] = 1; next }
+            {
+                sp1 = index($0, " "); if (sp1 == 0) next
+                size = substr($0, 1, sp1 - 1)
+                rest = substr($0, sp1 + 1)
+                sp2 = index(rest, " "); if (sp2 == 0) next
+                path = substr(rest, sp2 + 1)
+                if (index(path, prefix) == 1) path = substr(path, length(prefix) + 1)
+                if (path in want) total += size
+            }
+            END { printf "%d", total }' "$TMPDIR_WORK/upload_names" "$TMPDIR_WORK/statlist")"
+        case "$total_upload_bytes" in ''|*[!0-9]*) total_upload_bytes=0 ;; esac
+    fi
+fi
+
+echo "Target : $DEPLOY_URL${TARGET_NAME:+   [$TARGET_NAME]}"
 if [ "$GIT_MODE" -eq 1 ]; then
     if [ "$MODE_FULL" -eq 1 ]; then modeword="full resync"; else modeword="incremental"; fi
     echo "Mode   : git ($modeword) — commit ${HEAD:0:10}"
     [ -n "$LAST" ] && [ "$MODE_FULL" -eq 0 ] && echo "Since  : ${LAST:0:10}"
 fi
-echo "Upload : ${#UPLOADS[@]}   Delete: ${#DELETES[@]}"
+if [ "${#UPLOADS[@]}" -gt 0 ]; then
+    echo "Upload : ${#UPLOADS[@]} ($(fmt_bytes "$total_upload_bytes"))   Delete: ${#DELETES[@]}"
+else
+    echo "Upload : ${#UPLOADS[@]}   Delete: ${#DELETES[@]}"
+fi
 echo
 
 if [ "${#UPLOADS[@]}" -gt 0 ]; then
@@ -576,10 +1015,23 @@ if [ "${#DELETES[@]}" -gt 0 ]; then
     printf '  - %s\n' "${DELETES[@]}"
 fi
 
+if [ "${#DELETES[@]}" -gt 0 ] && [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+    { echo; printf 'Delete %d file(s) from the live site%s and proceed? [y/N] ' "${#DELETES[@]}" "${TARGET_NAME:+ [$TARGET_NAME]}"; } >/dev/tty 2>/dev/null || true
+    IFS= read -r _answer </dev/tty || _answer=""
+    case "$_answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) echo "Aborted — nothing sent. (--no-delete uploads without deleting; --yes skips this question.)"; exit 1 ;;
+    esac
+fi
+
 if [ "${#UPLOADS[@]}" -eq 0 ] && [ "${#DELETES[@]}" -eq 0 ]; then
     if [ "$GIT_MODE" -eq 1 ] && [ "$suppressed_deletes" -gt 0 ]; then
         echo "note: --no-delete left $suppressed_deletes file(s) on the server that commit ${HEAD:0:10} removes;" >&2
         echo "      the commit marker was NOT advanced (the server does not match this commit). Re-run without --no-delete to reconcile." >&2
+        exit 0
+    fi
+    if [ "$GIT_MODE" -eq 0 ] && [ "$suppressed_deletes" -gt 0 ]; then
+        echo "note: --no-delete left $suppressed_deletes file(s) on the server that your working tree no longer has. Re-run without --no-delete to reconcile." >&2
         exit 0
     fi
     if [ "$GIT_MODE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && [ "$LAST" != "$HEAD" ]; then
@@ -597,12 +1049,36 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
+if [ -n "$SNAPSHOT_ID" ]; then
+    st="$(curl -sS -K "$CURLRC" --connect-timeout 15 --max-time 30 "$DEPLOY_URL?action=status" 2>/dev/null || true)"
+    case "$st" in
+        *'"backups_writable":false'*)
+            echo "error: the server cannot write backup snapshots (.phpush-backups is not writable, or the disk is full)." >&2
+            echo "       Nothing was deployed. Fix the folder on the host, or deploy without a safety net using --no-backup." >&2
+            exit 1 ;;
+    esac
+    case "$st" in
+        *'"ok":true'*)
+            pmb="$(printf '%s' "$st" | sed -n 's/.*"post_max_bytes":\(-\{0,1\}[0-9][0-9]*\).*/\1/p')"
+            if [ -n "$pmb" ] && [ "$pmb" -gt 0 ] && [ "$CHUNK_BYTES" -gt "$pmb" ]; then
+                echo "note: upload chunks ($(fmt_bytes "$CHUNK_BYTES")) exceed the host's post_max_size ($(fmt_bytes "$pmb")) —" >&2
+                echo "      if uploads fail with HTTP 413, set DEPLOY_CHUNK_BYTES=$pmb or lower (a plain number of bytes, not '2M')." >&2
+            fi
+            free_b="$(printf '%s' "$st" | sed -n 's/.*"disk_free_bytes":\(-\{0,1\}[0-9][0-9]*\).*/\1/p')"
+            if [ -n "$free_b" ] && [ "$free_b" -ge 0 ] && [ "$total_upload_bytes" -gt 0 ] && [ "$free_b" -lt $((total_upload_bytes * 2)) ]; then
+                echo "warning: the host reports only $(fmt_bytes "$free_b") free — this deploy needs ~$(fmt_bytes "$total_upload_bytes") plus backup space." >&2
+            fi
+            ;;
+    esac
+fi
+
 echo
 
+uploads_done=0
 run_uploads
 
-if [ "$upload_failures" -gt 0 ]; then
-    echo "WARNING: $upload_failures file(s) failed to upload — server is NOT in sync and deletes were SKIPPED. Re-run to retry." >&2
+if [ "$upload_failures" -gt 0 ] || [ "$uploads_done" -ne "${#UPLOADS[@]}" ]; then
+    echo "WARNING: $((${#UPLOADS[@]} - uploads_done)) file(s) failed to upload — server is NOT in sync and deletes were SKIPPED. Re-run to retry." >&2
     exit 1
 fi
 
@@ -621,8 +1097,13 @@ if [ "$GIT_MODE" -eq 1 ]; then
         echo "Done (uploads only). --no-delete left $suppressed_deletes file(s) that commit ${HEAD:0:10} removes; the commit marker was NOT advanced so a later run without --no-delete can reconcile." >&2
     fi
 else
-    [ "$delete_failures" -eq 0 ] && echo "Done. The server now mirrors your working tree." \
-        || echo "WARNING: some deletes were rejected — the server does not fully mirror your working tree. Re-run to retry." >&2
+    if [ "$delete_failures" -ne 0 ]; then
+        echo "WARNING: some deletes were rejected — the server does not fully mirror your working tree. Re-run to retry." >&2
+    elif [ "$suppressed_deletes" -gt 0 ]; then
+        echo "Done (uploads only). --no-delete left $suppressed_deletes file(s) on the server that your working tree no longer has. Re-run without --no-delete to reconcile." >&2
+    else
+        echo "Done. The server now mirrors your working tree."
+    fi
 fi
 
 [ "$delete_failures" -eq 0 ] || exit 1
